@@ -1,0 +1,18 @@
+[gd_scene format=3 uid="uid://cb27d5rhrppcq"]
+
+[ext_resource type="Texture2D" uid="uid://daju54xqho72c" path="res://MainScreen/pixil-frame-0(1).png" id="1_ha1si"]
+[ext_resource type="Script" uid="uid://64h3fjltpht4" path="res://MainScreen/DarwinianLogic.gd" id="1_hd26k"]
+
+[sub_resource type="CylinderShape3D" id="CylinderShape3D_l2mt1"]
+
+[node name="CharacterBody3D" type="CharacterBody3D" unique_id=1527634169]
+script = ExtResource("1_hd26k")
+
+[node name="Sprite3D" type="Sprite3D" parent="." unique_id=52187425]
+pixel_size = 0.2
+billboard = 1
+texture_filter = 0
+texture = ExtResource("1_ha1si")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1534717369]
+shape = SubResource("CylinderShape3D_l2mt1")

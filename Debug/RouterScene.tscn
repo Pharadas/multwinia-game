@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bpkk053dyukrf"]
+
+[ext_resource type="Script" uid="uid://bov48olvx6ikj" path="res://Debug/router_scene.gd" id="1_57nij"]
+
+[node name="RouterScene" type="Node2D" unique_id=1733289595]
+script = ExtResource("1_57nij")
