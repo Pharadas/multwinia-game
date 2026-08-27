@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://ivghfedl4t88"
+path="res://.godot/imported/render.glsl-a11531e796547f7872049637b1a2617d.res"
+
+[deps]
+
+source_file="res://Demos/stupid simple/render.glsl"
+dest_files=["res://.godot/imported/render.glsl-a11531e796547f7872049637b1a2617d.res"]
+
+[params]
+

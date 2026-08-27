@@ -1,0 +1,58 @@
+[gd_scene format=3 uid="uid://lpcmk4v88nxy"]
+
+[ext_resource type="Script" uid="uid://b7qj7ulo2gojn" path="res://MainScreen/gpu_darwinian.gd" id="1_gpuswarm"]
+[ext_resource type="Script" uid="uid://cunxinpqlgrsd" path="res://MainScreen/position_logic.gd" id="2_gpuswarm"]
+[ext_resource type="Shader" uid="uid://wkck58lj8bjh" path="res://MainScreen/gpu_swarm.gdshader" id="3_gpuswarm"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_swarm"]
+shader = ExtResource("3_gpuswarm")
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_dot"]
+resource_local_to_scene = true
+shading_mode = 0
+vertex_color_use_as_albedo = true
+
+[sub_resource type="SphereMesh" id="SphereMesh_dot"]
+resource_local_to_scene = true
+material = SubResource("StandardMaterial3D_dot")
+radius = 1.0
+height = 2.0
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_presence"]
+radius = 1.5
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_vision"]
+radius = 12.0
+
+[node name="GpuDarwinian" type="Node3D" unique_id=1616514514]
+script = ExtResource("1_gpuswarm")
+
+[node name="GPUParticles3D" type="GPUParticles3D" parent="." unique_id=2135263180]
+amount = 1
+lifetime = 6.0
+preprocess = 5.0
+visibility_aabb = AABB(-15, -6, -15, 30, 12, 30)
+local_coords = true
+process_material = SubResource("ShaderMaterial_swarm")
+draw_pass_1 = SubResource("SphereMesh_dot")
+
+[node name="Presence" type="StaticBody3D" parent="." unique_id=1242073242]
+collision_mask = 0
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Presence" unique_id=1718771180]
+shape = SubResource("SphereShape3D_presence")
+
+[node name="VisionArea" type="Area3D" parent="." unique_id=1519455965]
+collision_layer = 0
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="VisionArea" unique_id=885567601]
+shape = SubResource("SphereShape3D_vision")
+
+[node name="GroundRay" type="RayCast3D" parent="." unique_id=1706267880]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 0)
+target_position = Vector3(0, -20, 0)
+collision_mask = 2
+script = ExtResource("2_gpuswarm")
+
+[connection signal="body_entered" from="VisionArea" to="." method="_on_vision_area_body_entered"]
+[connection signal="body_exited" from="VisionArea" to="." method="_on_vision_area_body_exited"]

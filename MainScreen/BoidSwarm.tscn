@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://rmx4co55xdfk"]
+
+[ext_resource type="Script" uid="uid://ctgjb003xahe2" path="res://MainScreen/boid_swarm.gd" id="1"]
+
+[node name="BoidSwarm" type="Node3D" unique_id=1200838514]
+script = ExtResource("1")

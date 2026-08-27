@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bo2ewhm118oej"
+path="res://.godot/imported/prefixsum.glsl-577abc4c87dd16e5028444e8da715581.res"
+
+[deps]
+
+source_file="res://Demos/stupid simple/prefixsum.glsl"
+dest_files=["res://.godot/imported/prefixsum.glsl-577abc4c87dd16e5028444e8da715581.res"]
+
+[params]
+

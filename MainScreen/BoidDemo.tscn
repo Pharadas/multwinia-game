@@ -1,0 +1,44 @@
+[gd_scene format=3 uid="uid://c223ul1khyro1"]
+
+[ext_resource type="Script" uid="uid://lqfw0aqrpxfq" path="res://MainScreen/boid_demo.gd" id="1"]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_1"]
+sky_top_color = Color(0.15, 0.25, 0.55, 1)
+sky_horizon_color = Color(0.55, 0.6, 0.7, 1)
+ground_bottom_color = Color(0.15, 0.12, 0.1, 1)
+ground_horizon_color = Color(0.35, 0.33, 0.3, 1)
+
+[sub_resource type="Sky" id="Sky_1"]
+sky_material = SubResource("ProceduralSkyMaterial_1")
+
+[sub_resource type="Environment" id="Environment_1"]
+background_mode = 2
+sky = SubResource("Sky_1")
+ambient_light_source = 2
+ambient_light_color = Color(0.4, 0.4, 0.45, 1)
+tonemap_mode = 2
+ssao_enabled = true
+glow_enabled = true
+glow_intensity = 0.4
+glow_blend_mode = 0
+
+[sub_resource type="Compositor" id="Compositor_1"]
+
+[node name="BoidDemo" type="Node3D" unique_id=1613319100]
+script = ExtResource("1")
+dot_scale = 10.0
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=810791832]
+environment = SubResource("Environment_1")
+compositor = SubResource("Compositor_1")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=2044594189]
+transform = Transform3D(1, 0, 0, 0, 0.173648, -0.984808, 0, 0.984808, 0.173648, 0, 40, 30)
+fov = 60.0
+near = 0.1
+far = 500.0
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1710697706]
+transform = Transform3D(1, 0, 0, 0, 0.866, 0.5, 0, -0.5, 0.866, 0, 30, 0)
+light_energy = 1.2
+shadow_enabled = true

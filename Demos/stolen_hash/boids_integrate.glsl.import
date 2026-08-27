@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://kfxq7e8tctsx"
+path="res://.godot/imported/boids_integrate.glsl-240b35d6e6f8791d810e3f2a830e229a.res"
+
+[deps]
+
+source_file="res://Demos/stolen_hash/boids_integrate.glsl"
+dest_files=["res://.godot/imported/boids_integrate.glsl-240b35d6e6f8791d810e3f2a830e229a.res"]
+
+[params]
+

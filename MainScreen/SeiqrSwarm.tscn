@@ -1,0 +1,38 @@
+[gd_scene format=3 uid="uid://c31vfou5fme2g"]
+
+[ext_resource type="Script" uid="uid://dgre5mh2831lb" path="res://MainScreen/seiqr_swarm.gd" id="1_swarm"]
+[ext_resource type="Shader" uid="uid://b7bwu31psvj12" path="res://MainScreen/seiqr_swarm.gdshader" id="2_swarm"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_swarm"]
+resource_local_to_scene = true
+shader = ExtResource("2_swarm")
+shader_parameter/objective = Vector3(0, 0, 0)
+shader_parameter/follow_strength = 2.5
+shader_parameter/orbit_speed = 0.9
+shader_parameter/sim_time = -1.0
+shader_parameter/dot_count = 1200
+shader_parameter/separation_strength = 2.5
+shader_parameter/neighbor_scale = 8.0
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_dot"]
+resource_local_to_scene = true
+shading_mode = 0
+vertex_color_use_as_albedo = true
+
+[sub_resource type="SphereMesh" id="SphereMesh_dot"]
+resource_local_to_scene = true
+material = SubResource("StandardMaterial3D_dot")
+radius = 0.1
+height = 0.1
+
+[node name="SeiqrSwarm" type="Node3D" unique_id=1585074050]
+script = ExtResource("1_swarm")
+
+[node name="GPUParticles3D" type="GPUParticles3D" parent="." unique_id=1061096070]
+emitting = false
+amount = 1200
+lifetime = 100.0
+preprocess = 2.0
+visibility_aabb = AABB(-600, -10, -600, 1200, 60, 1200)
+process_material = SubResource("ShaderMaterial_swarm")
+draw_pass_1 = SubResource("SphereMesh_dot")

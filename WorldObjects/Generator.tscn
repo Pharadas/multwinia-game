@@ -1,0 +1,37 @@
+[gd_scene format=3 uid="uid://6kxfyys7vvpo"]
+
+[ext_resource type="Script" uid="uid://bsal3weetm45c" path="res://WorldObjects/generator.gd" id="1_rctf0"]
+[ext_resource type="Script" uid="uid://bjshypehrq37j" path="res://WorldObjects/generator_area.gd" id="2_35r8f"]
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_35r8f"]
+top_radius = 2.0
+bottom_radius = 2.0
+height = 50.0
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_bhqlr"]
+resource_local_to_scene = true
+emission_enabled = true
+emission_energy_multiplier = 16.0
+emission_operator = 1
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_epfju"]
+size = Vector3(2.449768, 1, 2.366455)
+
+[node name="Generator" type="Node3D" unique_id=1997328669]
+script = ExtResource("1_rctf0")
+
+[node name="CSGMesh3D" type="CSGMesh3D" parent="." unique_id=1886406213]
+mesh = SubResource("CylinderMesh_35r8f")
+material = SubResource("StandardMaterial3D_bhqlr")
+
+[node name="GeneratorArea" type="Area3D" parent="." unique_id=156082390]
+collision_layer = 2
+script = ExtResource("2_35r8f")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="GeneratorArea" unique_id=1830522168]
+transform = Transform3D(7, 0, 0, 0, 50, 0, 0, 0, 7, 0, 0, 0)
+shape = SubResource("BoxShape3D_epfju")
+
+[connection signal="area_entered" from="GeneratorArea" to="GeneratorArea" method="_on_area_entered"]
+[connection signal="body_entered" from="GeneratorArea" to="GeneratorArea" method="_on_body_entered"]
+[connection signal="body_exited" from="GeneratorArea" to="GeneratorArea" method="_on_body_exited"]

@@ -1,18 +1,97 @@
 [gd_scene format=3 uid="uid://cb27d5rhrppcq"]
 
-[ext_resource type="Texture2D" uid="uid://daju54xqho72c" path="res://MainScreen/pixil-frame-0(1).png" id="1_ha1si"]
 [ext_resource type="Script" uid="uid://64h3fjltpht4" path="res://MainScreen/DarwinianLogic.gd" id="1_hd26k"]
+[ext_resource type="Texture2D" uid="uid://d24qbju5u3j60" path="res://MainScreen/pixil-frame-0(4).png" id="2_hd26k"]
+[ext_resource type="Script" uid="uid://cunxinpqlgrsd" path="res://MainScreen/position_logic.gd" id="3_hd26k"]
+[ext_resource type="AudioStream" uid="uid://nuli4tqki7gg" path="res://MainScreen/laser.mp3" id="4_vjqjb"]
 
-[sub_resource type="CylinderShape3D" id="CylinderShape3D_l2mt1"]
+[sub_resource type="BoxShape3D" id="BoxShape3D_ha1si"]
+size = Vector3(1, 2.0766602, 1)
 
-[node name="CharacterBody3D" type="CharacterBody3D" unique_id=1527634169]
+[sub_resource type="ParticleProcessMaterial" id="ParticleProcessMaterial_l2mt1"]
+resource_local_to_scene = true
+lifetime_randomness = 0.01
+particle_flag_align_y = true
+emission_shape = 3
+emission_box_extents = Vector3(1, 1, 1)
+angle_min = 1.0728835e-05
+angle_max = 1.0728835e-05
+direction = Vector3(0, 0, 0)
+spread = 12.706
+initial_velocity_min = 91.49
+initial_velocity_max = 91.49
+gravity = Vector3(0, 0, 0)
+linear_accel_min = -2.2351742e-06
+linear_accel_max = -2.2351742e-06
+
+[sub_resource type="ORMMaterial3D" id="ORMMaterial3D_3p3fw"]
+resource_local_to_scene = true
+emission_enabled = true
+emission = Color(1, 1, 1, 1)
+emission_energy_multiplier = 1000.0
+emission_on_uv2 = true
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_mbgaw"]
+resource_local_to_scene = true
+material = SubResource("ORMMaterial3D_3p3fw")
+top_radius = 0.1
+bottom_radius = 0.1
+height = 1.0
+radial_segments = 4
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_epfju"]
+radius = 25.915743
+
+[node name="Darwinian" type="CharacterBody3D" unique_id=1527634169]
+collision_mask = 2
+axis_lock_angular_x = true
+axis_lock_angular_y = true
+axis_lock_angular_z = true
+floor_stop_on_slope = false
+floor_block_on_wall = false
+floor_max_angle = 1.553343
+safe_margin = 0.5
 script = ExtResource("1_hd26k")
+separation_strength = 0.0
+formation_file_spacing = 4.0
+formation_rank_spacing = 4.0
 
 [node name="Sprite3D" type="Sprite3D" parent="." unique_id=52187425]
-pixel_size = 0.2
+pixel_size = 1.0
 billboard = 1
 texture_filter = 0
-texture = ExtResource("1_ha1si")
+texture = ExtResource("2_hd26k")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1534717369]
-shape = SubResource("CylinderShape3D_l2mt1")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.026611328, 0)
+shape = SubResource("BoxShape3D_ha1si")
+
+[node name="GPUParticles3D" type="GPUParticles3D" parent="." unique_id=1401963872]
+emitting = false
+amount = 64
+lifetime = 0.29000000000000004
+draw_order = 1
+trail_enabled = true
+trail_lifetime = 0.01
+process_material = SubResource("ParticleProcessMaterial_l2mt1")
+draw_pass_1 = SubResource("CylinderMesh_mbgaw")
+
+[node name="VisionArea" type="Area3D" parent="." unique_id=1952211127]
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="VisionArea" unique_id=1404340192]
+shape = SubResource("SphereShape3D_epfju")
+
+[node name="RayCast3D" type="RayCast3D" parent="." unique_id=615818433]
+target_position = Vector3(0, -7, 0)
+collision_mask = 2
+debug_shape_thickness = 5
+script = ExtResource("3_hd26k")
+
+[node name="AudioStreamPlayer3D" type="AudioStreamPlayer3D" parent="." unique_id=1368383355]
+stream = ExtResource("4_vjqjb")
+volume_db = 0.5
+unit_size = 50.0
+max_db = 1.0
+
+[connection signal="body_entered" from="VisionArea" to="." method="_on_vision_area_body_entered"]
+[connection signal="body_exited" from="VisionArea" to="." method="_on_vision_area_body_exited"]

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dpr1jj3ethd6f"
+path="res://.godot/imported/scatter.glsl-6480acf243f456afecdca3902cfcb477.res"
+
+[deps]
+
+source_file="res://Demos/stupid simple/scatter.glsl"
+dest_files=["res://.godot/imported/scatter.glsl-6480acf243f456afecdca3902cfcb477.res"]
+
+[params]
+

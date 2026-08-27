@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://2d4hirhuc324"]
+
+[ext_resource type="Script" uid="uid://cc14eux22ydse" path="res://MainScreen/hex_tile.gd" id="1_cai65"]
+
+[node name="StaticBody3D" type="StaticBody3D" unique_id=546817594]
+script = ExtResource("1_cai65")

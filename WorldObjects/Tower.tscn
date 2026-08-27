@@ -1,0 +1,108 @@
+[gd_scene format=3 uid="uid://cyb0dul1k7ufj"]
+
+[ext_resource type="Script" uid="uid://dpu70r7dr8y7a" path="res://WorldObjects/tower.gd" id="1_tower"]
+[ext_resource type="AudioStream" uid="uid://nuli4tqki7gg" path="res://MainScreen/laser.mp3" id="2_audio"]
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_base"]
+top_radius = 7.0
+bottom_radius = 7.0
+height = 5.0
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_shaft"]
+top_radius = 4.5
+bottom_radius = 4.5
+height = 20.0
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_top"]
+top_radius = 2.5
+bottom_radius = 2.5
+height = 5.0
+
+[sub_resource type="CylinderShape3D" id="CylinderShape3D_attack"]
+height = 30.0
+radius = 45.0
+
+[sub_resource type="CylinderShape3D" id="CylinderShape3D_body"]
+height = 30.0
+radius = 7.0
+
+[sub_resource type="ParticleProcessMaterial" id="ParticleProcessMaterial_beam"]
+resource_local_to_scene = true
+lifetime_randomness = 0.01
+particle_flag_align_y = true
+emission_shape = 3
+emission_box_extents = Vector3(1, 1, 1)
+angle_min = 1.0728835e-05
+angle_max = 1.0728835e-05
+direction = Vector3(0, 0, 0)
+spread = 0.0
+initial_velocity_min = 38.0
+initial_velocity_max = 38.0
+gravity = Vector3(0, 0, 0)
+linear_accel_min = -2.2351742e-06
+linear_accel_max = -2.2351742e-06
+
+[sub_resource type="ORMMaterial3D" id="ORMMaterial3D_beam"]
+resource_local_to_scene = true
+emission_enabled = true
+emission = Color(1, 1, 1, 1)
+emission_energy_multiplier = 1000.0
+emission_on_uv2 = true
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_beam"]
+resource_local_to_scene = true
+material = SubResource("ORMMaterial3D_beam")
+top_radius = 0.15
+bottom_radius = 0.15
+height = 1.5
+radial_segments = 4
+
+[node name="Tower" type="StaticBody3D" unique_id=833286676]
+collision_layer = 3
+input_ray_pickable = false
+script = ExtResource("1_tower")
+
+[node name="Base" type="MeshInstance3D" parent="." unique_id=1044671309]
+mesh = SubResource("CylinderMesh_base")
+
+[node name="Shaft" type="MeshInstance3D" parent="." unique_id=2136820481]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 15, 0)
+mesh = SubResource("CylinderMesh_shaft")
+
+[node name="Top" type="MeshInstance3D" parent="." unique_id=292964255]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 27.5, 0)
+mesh = SubResource("CylinderMesh_top")
+
+# The tower body itself needs a collision shape: darwinians detect and
+# shoot it through this (their VisionArea mask 1 / LOS mask 2 see it on
+# collision_layer 3), and without it they walked straight through the
+# tower since it had no solid body at all.
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1485799678]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 15, 0)
+shape = SubResource("CylinderShape3D_body")
+
+[node name="AttackArea" type="Area3D" parent="." unique_id=501506595]
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="AttackArea" unique_id=1485799677]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 15, 0)
+shape = SubResource("CylinderShape3D_attack")
+
+[node name="GPUParticles3D" type="GPUParticles3D" parent="." unique_id=370808390]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 27.5, 0)
+emitting = false
+amount = 96
+lifetime = 1.84
+draw_order = 1
+trail_enabled = true
+trail_lifetime = 0.01
+process_material = SubResource("ParticleProcessMaterial_beam")
+draw_pass_1 = SubResource("CylinderMesh_beam")
+
+[node name="AudioStreamPlayer3D" type="AudioStreamPlayer3D" parent="." unique_id=1910626803]
+stream = ExtResource("2_audio")
+volume_db = 0.5
+unit_size = 80.0
+max_db = 1.0
+
+[connection signal="body_entered" from="AttackArea" to="." method="_on_attack_area_body_entered"]
+[connection signal="body_exited" from="AttackArea" to="." method="_on_attack_area_body_exited"]

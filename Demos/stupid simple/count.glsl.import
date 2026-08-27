@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://bki7x8mm7j7ev"
+path="res://.godot/imported/count.glsl-7b51a565d212884e5ab1daeb674169e9.res"
+
+[deps]
+
+source_file="res://Demos/stupid simple/count.glsl"
+dest_files=["res://.godot/imported/count.glsl-7b51a565d212884e5ab1daeb674169e9.res"]
+
+[params]
+

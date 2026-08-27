@@ -1,0 +1,18 @@
+[gd_scene format=3 uid="uid://dwokfexfnuv0i"]
+
+[ext_resource type="Script" uid="uid://cy56tknvpre8v" path="res://Demos/sph_fluid/sph_simulation.gd" id="1_sim"]
+
+[node name="SPHFluidDemo" type="Node3D" unique_id=1946229998]
+
+[node name="FluidSimulation" type="Node3D" parent="." unique_id=1400138548]
+script = ExtResource("1_sim")
+
+[node name="MultiMeshInstance3D" type="MultiMeshInstance3D" parent="FluidSimulation" unique_id=1950870414]
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1292382209]
+transform = Transform3D(1, 0, 0, 0, 0.707107, 0.707107, 0, -0.707107, 0.707107, 3, 3, 3)
+fov = 60.0
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1448005676]
+transform = Transform3D(0.866025, -0.433013, 0.25, 0, 0.5, 0.866025, -0.5, -0.75, 0.433013, 0, 5, 0)
+light_energy = 1.5

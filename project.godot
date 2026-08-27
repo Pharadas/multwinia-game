@@ -11,13 +11,20 @@ config_version=5
 [application]
 
 config/name="Phone AOE"
-run/main_scene="uid://byc0si1njqjhi"
+run/main_scene="res://MainScreen/BoidDemo.tscn"
 config/features=PackedStringArray("4.7", "Mobile")
 
 [display]
 
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
+
+[input]
+
+click={
+"deadzone": 0.2,
+"events": []
+}
 
 [physics]
 
@@ -26,4 +33,5 @@ window/stretch/aspect="expand"
 [rendering]
 
 rendering_device/driver.windows="d3d12"
-renderer/rendering_method="mobile"
+textures/vram_compression/import_etc2_astc=true
+textures/default_filters/use_nearest_mipmap_filter=true
