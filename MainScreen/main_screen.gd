@@ -1,4 +1,4 @@
-@tool
+#@tool
 extends Node3D
 
 const darwinian_scene := preload("res://MainScreen/Darwinian.tscn")
@@ -109,9 +109,9 @@ func _ready() -> void:
 	terrain_ready.connect(_on_terrain_ready)
 	generate_terrain()
 
-	#var socket := get_node_or_null("Socket")
-	#if socket and socket.has_signal("player_joined"):
-		#socket.player_joined.connect(_on_player_joined)
+	var socket := get_node_or_null("Socket")
+	if socket and socket.has_signal("drawn_path_received"):
+		socket.drawn_path_received.connect(_on_drawn_path_received)
 
 
 func _on_player_joined(team: int) -> void:
@@ -121,6 +121,15 @@ func _on_player_joined(team: int) -> void:
 		return
 	spawned_teams[team] = true
 	_spawn_team_army(team)
+
+
+func _on_drawn_path_received(points: Array, team: int) -> void:
+	var ss = $StupidSimple.get_child(0)
+	if points.is_empty():
+		print("no points to draw path!")
+		return
+	ss.set_path(points)
+	print("Global path set: %d points for team %d" % [points.size(), team])
 
 
 ## Drops `team`'s starting units into its walled corner base.
@@ -437,8 +446,10 @@ func _spawn_hex(col: int, row: int, img: Image, width: int, depth: int, center_u
 	add_child(tile)
 	var key := _tile_key(col, row)
 	tile.is_wall = is_wall
-	tile.force_generator = _force_generators.get(key, false)
-	tile.no_random_generator = _no_random_generators.has(key)
+	# tile.force_generator = _force_generators.get(key, false)
+	tile.force_generator = false
+	# tile.no_random_generator = _no_random_generators.has(key)
+	tile.no_random_generator = true
 	tile.build(col, row, img, width, depth, center_u, center_v, hex_size, hex_detail, height_scale, mesh_scale, color, mat, vertex_cache)
 	tile.hex_clicked.connect(_on_hex_clicked)
 
@@ -587,14 +598,15 @@ func _process(delta: float) -> void:
 	if hex_nodes.is_empty():
 		return
 	_drop_timer += delta
-	if _drop_timer >= DROP_INTERVAL:
-		_drop_timer = 0.0
-		if not _has_active_box():
-			_spawn_drop_box()
+	# if _drop_timer >= DROP_INTERVAL:
+	# 	_drop_timer = 0.0
+	# 	if not _has_active_box():
+	# 		_spawn_drop_box()
 
 
 func _on_terrain_ready() -> void:
-	_spawn_drop_box()
+	pass
+	# _spawn_drop_box()
 
 
 ## Drops a crate from the sky onto a random, non-wall hex. The crate lands

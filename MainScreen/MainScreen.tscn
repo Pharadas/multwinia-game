@@ -7,7 +7,7 @@
 [sub_resource type="Gradient" id="Gradient_esa1g"]
 
 [sub_resource type="FastNoiseLite" id="FastNoiseLite_hdewi"]
-seed = 22070319
+seed = -492181015
 frequency = 0.05
 fractal_type = 3
 fractal_octaves = 10
@@ -37,18 +37,17 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -10.7089, 0)
 script = ExtResource("1_hdewi")
 heightmap_image = SubResource("NoiseTexture2D_4rxas")
 height_scale = 0.0
-mesh_scale = 8.0
-hex_size = 2.0
-grid_depth = 10
+mesh_scale = 10.0
+grid_width = 40
 wall_tile_chance = 0.2
 hex_detail = 32
 shader_path = "res://MainScreen/hex_sector.gdshader"
 hex_terrain_socket_path = NodePath("Socket")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=1853939596]
-transform = Transform3D(1, 0, 0, 0, 0.6704742, 0.74193287, 0, -0.74193287, 0.6704742, 0, 310.36432, 258.0608)
+transform = Transform3D(1, 0, 0, 0, 0.7071068, 0.7071068, 0, -0.7071068, 0.7071068, 0, 295.563, 287.328)
 projection = 1
-size = 300.0
+size = 332.27213
 
 [node name="AudioListener3D" type="AudioListener3D" parent="Camera3D" unique_id=1209120654]
 current = true

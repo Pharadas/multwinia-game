@@ -70,6 +70,9 @@ signal new_road_remote(from_cell: Vector2i, to_cell: Vector2i)
 ## Emitted whenever a new phone connects and is assigned a team number.
 signal player_joined(team: int)
 
+## Emitted when a phone sends a free-drawn path (simplified to 16 points).
+signal drawn_path_received(points: Array, team: int)
+
 var _server := TCPServer.new()
 var _discovery_udp := PacketPeerUDP.new()
 
@@ -120,6 +123,9 @@ func _process(_delta: float) -> void:
 		var tcp := _server.take_connection()
 		var peer := PacketPeerStream.new()
 		peer.stream_peer = tcp
+		# Increase output buffer to handle large terrain packets.
+		peer.output_buffer_max_size = 4 * 1024 * 1024
+		peer.input_buffer_max_size = 4 * 1024 * 1024
 		var client := {"tcp": tcp, "peer": peer, "team": -1}
 		_clients.append(client)
 		print("HexTerrainSocket: phone connected (%d total)." % _clients.size())
@@ -232,6 +238,54 @@ func _handle_message(msg, from_peer: PacketPeerStream) -> void:
 		"clear_roads":
 			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
 			_apply_clear_roads(team_number)
+
+		"drawn_path":
+			var points: Array = msg.points
+			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
+			var ref_cells: Array = msg.get("ref_cells", [])
+			var ref_locals: Array = msg.get("ref_locals", [])
+			var world_points := _tilemap_points_to_world(points, ref_cells, ref_locals)
+			print("receiving path: ", world_points)
+			drawn_path_received.emit(world_points, team_number)
+
+
+func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array) -> Array:
+	var terrain := _get_terrain()
+	if points.is_empty():
+		return []
+
+	if ref_cells.size() >= 3 and ref_locals.size() >= 3 and terrain and terrain.has_method("get_hex_center"):
+		var c0: Vector2i = ref_cells[0]
+		var c1: Vector2i = ref_cells[1]
+		var c2: Vector2i = ref_cells[2]
+
+		var l0: Vector2 = ref_locals[0] if ref_locals[0] is Vector2 else Vector2(ref_locals[0].x, ref_locals[0].y)
+		var l1: Vector2 = ref_locals[1] if ref_locals[1] is Vector2 else Vector2(ref_locals[1].x, ref_locals[1].y)
+		var l2: Vector2 = ref_locals[2] if ref_locals[2] is Vector2 else Vector2(ref_locals[2].x, ref_locals[2].y)
+
+		var w0_3d: Vector3 = terrain.get_hex_center(c0.x, c0.y)
+		var w1_3d: Vector3 = terrain.get_hex_center(c1.x, c1.y)
+		var w2_3d: Vector3 = terrain.get_hex_center(c2.x, c2.y)
+
+		var w0 := Vector2(w0_3d.x, w0_3d.z)
+		var w1 := Vector2(w1_3d.x, w1_3d.z)
+		var w2 := Vector2(w2_3d.x, w2_3d.z)
+
+		var dx_local := l1.x - l0.x
+		var dy_local := l2.y - l0.y
+
+		var scale_x := (w1.x - w0.x) / dx_local if absf(dx_local) > 0.001 else 1.0
+		var scale_y := (w2.y - w0.y) / dy_local if absf(dy_local) > 0.001 else 1.0
+
+		var out: Array = []
+		for pt in points:
+			var p: Vector2 = pt if pt is Vector2 else Vector2(float(pt.get("x", 0)), float(pt.get("y", 0)))
+			var wx := w0.x + (p.x - l0.x) * scale_x
+			var wz := w0.y + (p.y - l0.y) * scale_y
+			out.append(Vector2(wx, wz))
+		return out
+
+	return points
 
 
 func _get_terrain() -> Node:

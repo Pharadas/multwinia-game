@@ -64,6 +64,9 @@ var _discovery_total_elapsed := 0.0
 func _ready() -> void:
 	_peer = PacketPeerStream.new()
 	_peer.stream_peer = _tcp
+	# Match the server's buffer size so large terrain packets can pass through.
+	_peer.output_buffer_max_size = 4 * 1024 * 1024
+	_peer.input_buffer_max_size = 4 * 1024 * 1024
 
 	if use_lan_discovery:
 		_start_discovery()
@@ -233,3 +236,9 @@ func send_clear_roads(team_number: int) -> void:
 	print("sending clear roads request from phone socket for team ", team_number)
 	if _peer and _was_connected:
 		_peer.put_var({"type": "clear_roads", "team": team_number})
+
+## Called by HexGrid2D when a free-drawn path is simplified to 16 points.
+## Sends the tilemap-local positions plus reference cell mappings to the main screen.
+func send_drawn_path(points: Array, team_number: int, ref_cells: Array = [], ref_locals: Array = []) -> void:
+	if _peer and _was_connected:
+		_peer.put_var({"type": "drawn_path", "points": points, "team": team_number, "ref_cells": ref_cells, "ref_locals": ref_locals})

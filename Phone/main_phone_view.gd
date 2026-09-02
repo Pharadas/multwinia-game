@@ -105,6 +105,12 @@ var _last_sent_hover_cell = null # Vector2i - last cell broadcast via _send_clic
 var _touch_active: bool = false # true while a real finger (not an emulated mouse event) is down/dragging
 var _touch_position: Vector2 = Vector2.ZERO # last known touch position, in the same global/viewport space as mouse position
 
+# --- Draw mode: free-draw a path, simplify to 16 points, send over network
+var _draw_mode: bool = false
+var _draw_points: PackedVector2Array = []
+var _draw_line: Line2D = null
+const DRAW_SAMPLE_COUNT := 16
+
 # Roads, keyed by an order-independent string so a drag from either end
 # finds the same road. Each entry stores the Line2D/marker nodes that make
 # up that road (so a single road can be removed without touching the rest)
@@ -152,10 +158,102 @@ func _setup_ui() -> void:
 	btn.pressed.connect(_on_reset_roads_pressed)
 	canvas.add_child(btn)
 
+	var draw_btn := Button.new()
+	draw_btn.name = "DrawModeButton"
+	draw_btn.text = "Draw Path"
+	draw_btn.anchor_left = 0.0
+	draw_btn.anchor_top = 0.0
+	draw_btn.anchor_right = 0.0
+	draw_btn.anchor_bottom = 0.0
+	draw_btn.offset_left = 20.0
+	draw_btn.offset_top = 20.0
+	draw_btn.offset_right = 150.0
+	draw_btn.offset_bottom = 70.0
+	draw_btn.toggle_mode = true
+	draw_btn.toggled.connect(_on_draw_mode_toggled)
+	canvas.add_child(draw_btn)
+
 
 func _on_reset_roads_pressed() -> void:
 	_clear_connections()
 	_send_reset_roads_over_network()
+
+
+func _on_draw_mode_toggled(pressed: bool) -> void:
+	_draw_mode = pressed
+	if not pressed and _draw_points.size() >= 2:
+		_send_simplified_path()
+	_draw_points.clear()
+	if _draw_line:
+		_draw_line.queue_free()
+		_draw_line = null
+
+
+func _ensure_draw_line() -> void:
+	if _draw_line:
+		return
+	_draw_line = Line2D.new()
+	_draw_line.width = 8.0
+	_draw_line.default_color = Color(1.0, 0.3, 0.3, 0.9)
+	_draw_line.begin_cap_mode = Line2D.LINE_CAP_ROUND
+	_draw_line.end_cap_mode = Line2D.LINE_CAP_ROUND
+	# Add to tile_map_layer so it scales with the hex grid
+	tile_map_layer.add_child(_draw_line)
+
+
+## Uniformly sample `count` points along an arc-length parameterization
+## of `points`.
+func _simplify_path(points: PackedVector2Array, count: int) -> PackedVector2Array:
+	var n := points.size()
+	if n < 2 or count < 2:
+		return points
+
+	# Cumulative arc length
+	var cum := PackedFloat32Array()
+	cum.resize(n)
+	cum[0] = 0.0
+	for i in range(1, n):
+		cum[i] = cum[i - 1] + points[i - 1].distance_to(points[i])
+	var total := cum[n - 1]
+	if total < 0.001:
+		return points
+
+	var result := PackedVector2Array()
+	result.resize(count)
+	for s in range(count):
+		var target := total * float(s) / float(count - 1)
+		# Find segment
+		var seg := 0
+		for i in range(1, n):
+			if cum[i] >= target:
+				seg = i - 1
+				break
+			seg = i - 1
+		var seg_len := cum[mini(seg + 1, n - 1)] - cum[seg]
+		var frac := 0.0
+		if seg_len > 0.001:
+			frac = (target - cum[seg]) / seg_len
+		result[s] = points[seg].lerp(points[mini(seg + 1, n - 1)], frac)
+	return result
+
+
+func _send_simplified_path() -> void:
+	var simplified := _simplify_path(_draw_points, DRAW_SAMPLE_COUNT)
+	# Send raw tilemap-local positions (the smooth curve) plus reference
+	# cell mappings so the server can compute the affine transform to
+	# world-space without snapping to hex centers.
+	var ref_cells: Array = [Vector2i(0, 0), Vector2i(2, 0), Vector2i(0, 2)]
+	var ref_locals: Array = []
+	for c in ref_cells:
+		ref_locals.append(tile_map_layer.map_to_local(c))
+	_send_drawn_path_over_network(simplified, ref_cells, ref_locals)
+
+
+func _send_drawn_path_over_network(points: Array, ref_cells: Array = [], ref_locals: Array = []) -> void:
+	var socket := _get_socket_node()
+	print("sending drawn path: ", points)
+	if socket and socket.has_method("send_drawn_path"):
+		socket.send_drawn_path(points, team_number, ref_cells, ref_locals)
 
 
 ## Rebuilds the grid straight from network data - an array of
@@ -503,16 +601,24 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 
 	if event is InputEventScreenTouch:
-		# Only track a single finger, to keep the same one-drag-at-a-time
-		# semantics as a single mouse button.
 		if event.index != 0:
 			return
 		_touch_position = event.position
 		_touch_active = true
 		if event.pressed:
-			_start_drag()
+			if _draw_mode:
+				_draw_points.clear()
+				_draw_points.append(tile_map_layer.to_local(event.position))
+				_ensure_draw_line()
+			else:
+				_start_drag()
 		else:
-			_end_drag()
+			if _draw_mode:
+				if _draw_points.size() >= 2:
+					_send_simplified_path()
+				_draw_points.clear()
+			else:
+				_end_drag()
 			_touch_active = false
 		return
 
@@ -520,24 +626,42 @@ func _unhandled_input(event: InputEvent) -> void:
 		if event.index != 0:
 			return
 		_touch_position = event.position
+		if _draw_mode:
+			var local_pos = tile_map_layer.to_local(event.position)
+			if _draw_points.size() == 0 or _draw_points[_draw_points.size() - 1].distance_to(local_pos) > 5.0:
+				_draw_points.append(local_pos)
+				_ensure_draw_line()
+				_draw_line.points = _draw_points
 		return
 
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if _touch_active:
-			# Godot's "emulate mouse from touch" setting fires a synthetic
-			# mouse click alongside every real touch - the
-			# InputEventScreenTouch branch above already handled that
-			# gesture, so ignore the emulated echo here.
 			return
 		if event.pressed:
-			_start_drag()
+			if _draw_mode:
+				_draw_points.clear()
+				_draw_points.append(tile_map_layer.to_local(event.position))
+				_ensure_draw_line()
 		else:
-			_end_drag()
+			if _draw_mode:
+				if _draw_points.size() >= 2:
+					_send_simplified_path()
+				_draw_points.clear()
+			else:
+				_end_drag()
 
 
 func _process(_delta: float) -> void:
 	if not tile_map_layer:
 		return
+
+	# In draw mode with mouse held, capture mouse motion as draw points
+	if _draw_mode and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) and not _touch_active:
+		var local_pos = tile_map_layer.to_local(get_viewport().get_mouse_position())
+		if _draw_points.size() == 0 or _draw_points[_draw_points.size() - 1].distance_to(local_pos) > 5.0:
+			_draw_points.append(local_pos)
+			_ensure_draw_line()
+			_draw_line.points = _draw_points
 
 	# Continuously broadcast whatever cell the pointer (mouse or touch) is
 	# over right now, so the receiver always has an up-to-date hover

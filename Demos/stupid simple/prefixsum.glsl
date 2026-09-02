@@ -5,6 +5,7 @@ layout(set=0, binding=1, std430) buffer CellOffset { uint offsets[]; } cell_offs
 layout(set=0, binding=2, std430) buffer WriteCursor { uint cursor[]; } write_cursor;
 layout(push_constant) uniform PC {
     vec4 params; vec4 world_min; ivec4 grid_dims;
+    vec4 hex_params; ivec4 hex_grid;
 } pc;
 layout(local_size_x=1) in;
 

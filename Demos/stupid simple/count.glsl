@@ -1,10 +1,13 @@
 #[compute]
 #version 450
-struct BoidState { vec4 pos; vec4 vel; };
+
+struct BoidState { vec4 pos; vec4 vel; uint state; uint path_count; };
+
 layout(set=0, binding=0, std430) buffer StateBuf { BoidState boids[]; } state;
 layout(set=0, binding=1, std430) buffer CellCount { uint counts[]; } cell_count;
 layout(push_constant) uniform PC {
     vec4 params; vec4 world_min; ivec4 grid_dims;
+    vec4 hex_params; ivec4 hex_grid;
 } pc;
 layout(local_size_x=64) in;
 

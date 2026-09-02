@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://cm3w03pfxbm1n"]
+
+[ext_resource type="Script" uid="uid://bwk64gf3n2wcc" path="res://Demos/fft_draw/fft_draw.gd" id="1"]
+
+[node name="FFTDemo" type="Node2D" unique_id=614745550]
+script = ExtResource("1")
