@@ -1,7 +1,14 @@
 #[compute]
 #version 450
 
-struct BoidState { vec4 pos; vec4 vel; uint state; uint path_count; };
+struct BoidState {
+    vec4 pos;
+    vec4 vel;
+    uint state;
+    uint assigned_path_hex;
+    uint assigned_path_slot;
+    uint team;
+};
 
 struct InstanceData {
     vec4 row1; vec4 row2; vec4 row3; vec4 color;
@@ -30,10 +37,14 @@ void main() {
     mm_buffer.instances[id].row1 = vec4(right.x, up.x, fwd.x, pos.x);
     mm_buffer.instances[id].row2 = vec4(right.y, up.y, fwd.y, pos.y);
     mm_buffer.instances[id].row3 = vec4(right.z, up.z, fwd.z, pos.z);
-    // Color by hex ID (hash to a hue)
-    float hex_id = state.boids[id].pos.w;
-    float hue = fract(hex_id * 0.618033988);  // golden ratio spread
-    // HSV to RGB (simple version)
-    vec3 rgb = clamp(abs(mod(hue * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
-    mm_buffer.instances[id].color = vec4(rgb, 1.0);
+
+    // Color by team index (0..3)
+    uint boid_team = state.boids[id].team;
+    vec4 team_colors[4] = vec4[4](
+        vec4(0.9, 0.2, 0.2, 1.0), // Team 0: Red
+        vec4(0.2, 0.8, 0.2, 1.0), // Team 1: Green
+        vec4(0.2, 0.4, 0.9, 1.0), // Team 2: Blue
+        vec4(0.9, 0.8, 0.2, 1.0)  // Team 3: Yellow
+    );
+    mm_buffer.instances[id].color = team_colors[boid_team % 4u];
 }

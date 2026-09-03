@@ -12,7 +12,7 @@ struct BoidState {
     uint state;
     uint assigned_path_hex;
     uint assigned_path_slot;
-    uint reserved;
+    uint team;
 };
 
 layout(set=0, binding=0, std430) buffer ReadState { BoidState boids[]; } read_s;
@@ -103,6 +103,22 @@ int world_to_hex_id(vec3 pos) {
     return (col - min_q) + (row - min_r) * w;
 }
 
+const ivec3 NEIGHBOR_OFFSETS[27] = ivec3[27](
+    // Current cell first
+    ivec3( 0,  0,  0),
+    // 6 face neighbors
+    ivec3(-1,  0,  0), ivec3( 1,  0,  0),
+    ivec3( 0, -1,  0), ivec3( 0,  1,  0),
+    ivec3( 0,  0, -1), ivec3( 0,  0,  1),
+    // 12 edge neighbors
+    ivec3(-1, -1,  0), ivec3(-1,  1,  0), ivec3( 1, -1,  0), ivec3( 1,  1,  0),
+    ivec3(-1,  0, -1), ivec3(-1,  0,  1), ivec3( 1,  0, -1), ivec3( 1,  0,  1),
+    ivec3( 0, -1, -1), ivec3( 0, -1,  1), ivec3( 0,  1, -1), ivec3( 0,  1,  1),
+    // 8 corner neighbors
+    ivec3(-1, -1, -1), ivec3( 1, -1, -1), ivec3(-1,  1, -1), ivec3( 1,  1, -1),
+    ivec3(-1, -1,  1), ivec3( 1, -1,  1), ivec3(-1,  1,  1), ivec3( 1,  1,  1)
+);
+
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uint(pc.params.y)) return;
@@ -116,38 +132,35 @@ void main() {
     uint state = read_s.boids[id].state;
     uint assigned_hex = read_s.boids[id].assigned_path_hex;
     uint assigned_slot = read_s.boids[id].assigned_path_slot;
+    uint my_team = read_s.boids[id].team;
 
     vec3 sep = vec3(0.0), align = vec3(0.0), coh = vec3(0.0);
     int neighbors = 0;
     float perception = cell_size;
 
-    for (int dx = -1; dx <= 1; dx++) {
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                ivec3 neighbor_cell = my_cell + ivec3(dx, dy, dz);
-                if (any(lessThan(neighbor_cell, ivec3(0))) || any(greaterThanEqual(neighbor_cell, dims))) continue;
-                uint h = cell_index(neighbor_cell, dims);
-                uint start = cell_offset.offsets[h];
-                uint count = cell_count.counts[h];
+    for (int c = 0; c < 27 && neighbors < 25; c++) {
+        ivec3 neighbor_cell = my_cell + NEIGHBOR_OFFSETS[c];
+        if (any(lessThan(neighbor_cell, ivec3(0))) || any(greaterThanEqual(neighbor_cell, dims))) continue;
+        uint h = cell_index(neighbor_cell, dims);
+        uint start = cell_offset.offsets[h];
+        uint count = cell_count.counts[h];
 
-                for (uint k = 0; k < count; k++) {
-                    uint other_id = sorted.idx[start + k];
-                    if (other_id == id) continue;
-                    vec3 other_pos = read_s.boids[other_id].pos.xyz;
-                    float d = distance(pos, other_pos);
-                    if (other_id % 3 != id % 3) {
-                        if (d < perception && d > 0.001) {
-                            sep += (pos - other_pos) / (d * d);
-                        }
-                        continue;
-                    }
-                    if (d < perception && d > 0.001) {
-                        sep += (pos - other_pos) / (d * d);
-                        align += read_s.boids[other_id].vel.xyz;
-                        coh += other_pos;
-                        neighbors++;
-                    }
+        for (uint k = 0u; k < count && neighbors < 25; k++) {
+            uint other_id = sorted.idx[start + k];
+            if (other_id == id) continue;
+            vec3 other_pos = read_s.boids[other_id].pos.xyz;
+            float d = distance(pos, other_pos);
+            if (read_s.boids[other_id].team != my_team) {
+                if (d < perception && d > 0.001) {
+                    sep += (pos - other_pos) / (d * d);
                 }
+                continue;
+            }
+            if (d < perception && d > 0.001) {
+                sep += (pos - other_pos) / (d * d);
+                align += read_s.boids[other_id].vel.xyz;
+                coh += other_pos;
+                neighbors++;
             }
         }
     }
@@ -156,30 +169,39 @@ void main() {
     if (neighbors > 0) {
         align /= float(neighbors);
         coh = (coh / float(neighbors)) - pos;
-        accel = sep * 1.5 + align * 1.0 + coh * 1.0;
+        accel = sep * 4.0 + align * 1.0 + coh * 5.0;
     }
 
-    // 1. If boid has no path assigned, look at its current hex and pick a path slot based on boid ID
+    // 1. If boid has no path assigned, look at its current hex (or adjacent hexes) for team paths
     if (assigned_hex == NO_PATH) {
         int my_hex = world_to_hex_id(pos);
-        int total_paths = global_paths.hex_paths[my_hex].path_count;
-        if (total_paths > 0) {
+        int target_hex = -1;
+
+        int team_hex_idx = my_hex * 4 + int(my_team);
+        if (global_paths.hex_paths[team_hex_idx].path_count > 0) {
+            target_hex = my_hex;
+        }
+
+        if (target_hex >= 0) {
+            int t_hex_idx = target_hex * 4 + int(my_team);
+            int total_paths = global_paths.hex_paths[t_hex_idx].path_count;
             int active_count = min(total_paths, 10);
             uint chosen = id % uint(active_count);
-            if (global_paths.hex_paths[my_hex].paths[chosen].count > 0) {
-                assigned_hex = uint(my_hex);
+            if (global_paths.hex_paths[t_hex_idx].paths[chosen].count > 0) {
+                assigned_hex = uint(target_hex);
                 assigned_slot = chosen;
             }
         }
     }
 
-    // 2. If boid has an assigned path, follow it until destination is reached
+    // 2. If boid has an assigned path, follow its team's path until destination is reached
     if (assigned_hex != NO_PATH) {
-        int p_count = global_paths.hex_paths[assigned_hex].paths[assigned_slot].count;
+        int t_hex_idx = int(assigned_hex) * 4 + int(my_team);
+        int p_count = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].count;
         if (p_count <= 0) {
             assigned_hex = NO_PATH;
         } else if (p_count == 1) {
-            vec2 tp = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[0];
+            vec2 tp = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[0];
             vec3 target = vec3(tp.x, pos.y, tp.y);
             vec3 to_target = target - pos;
             float d = length(to_target.xz);
@@ -187,26 +209,22 @@ void main() {
                 accel += normalize(to_target) * 8.0;
                 state = STATE_HAS_PATH;
             } else {
-                // Reached destination -> free to accept a new path
                 assigned_hex = NO_PATH;
             }
         } else {
-            // Check distance to final destination point
-            vec2 final_pt = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[p_count - 1];
+            vec2 final_pt = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[p_count - 1];
             float dist_to_end = length(pos.xz - final_pt);
 
             if (dist_to_end <= 0.8) {
-                // Reached destination -> free to accept a new path!
                 assigned_hex = NO_PATH;
             } else {
-                // Find nearest segment along the assigned path
                 float min_dist_sq = 1e10;
                 int best_seg = 0;
-                vec2 best_proj = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[0];
+                vec2 best_proj = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[0];
 
                 for (int i = 0; i < p_count - 1; i++) {
-                    vec2 a = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[i];
-                    vec2 b = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[i + 1];
+                    vec2 a = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[i];
+                    vec2 b = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[i + 1];
                     vec2 ab = b - a;
                     float l2 = dot(ab, ab);
                     float t = 0.0;
@@ -223,13 +241,12 @@ void main() {
                     }
                 }
 
-                // Lookahead along the path from best_proj
                 float lookahead = 6.0;
                 vec2 target_2d = best_proj;
 
                 int curr_seg = best_seg;
                 vec2 seg_a = best_proj;
-                vec2 seg_b = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[curr_seg + 1];
+                vec2 seg_b = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[curr_seg + 1];
                 float seg_rem = length(seg_b - seg_a);
 
                 if (lookahead <= seg_rem) {
@@ -238,8 +255,8 @@ void main() {
                     float dist_needed = lookahead - seg_rem;
                     target_2d = seg_b;
                     for (int k = curr_seg + 1; k < p_count - 1; k++) {
-                        vec2 pA = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[k];
-                        vec2 pB = global_paths.hex_paths[assigned_hex].paths[assigned_slot].points[k + 1];
+                        vec2 pA = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[k];
+                        vec2 pB = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[k + 1];
                         float seg_len = length(pB - pA);
                         if (dist_needed <= seg_len) {
                             target_2d = pA + (seg_len > 0.001 ? (pB - pA) * (dist_needed / seg_len) : vec2(0.0));
@@ -281,9 +298,10 @@ void main() {
         pos += vel * pc.params.x;
     }
 
-    write_s.boids[id].pos = vec4(pos, float(world_to_hex_id(pos)));
+    write_s.boids[id].pos = vec4(pos, float(my_team));
     write_s.boids[id].vel = vec4(vel, 0.0);
     write_s.boids[id].state = state;
     write_s.boids[id].assigned_path_hex = assigned_hex;
     write_s.boids[id].assigned_path_slot = assigned_slot;
+    write_s.boids[id].team = my_team;
 }

@@ -55,6 +55,7 @@ var hex_width := 0
 var hex_total_cells := 0
 
 var frame_parity := 0
+var team_bases: Array = []
 
 
 func _ready() -> void:
@@ -87,6 +88,9 @@ func _ready() -> void:
 	_load_shaders()
 	_create_pipelines()
 	_create_buffers()
+	_compute_team_bases()
+	for t in range(4):
+		_spawn_team_army(t)
 	_build_uniform_sets()
 	_initial_dispatch()
 
@@ -189,6 +193,7 @@ func _create_buffers() -> void:
 	init_state.resize(instance_count * floats_per_boid)
 
 	for i in range(instance_count):
+		var team := i % 4
 		var base := i * floats_per_boid
 		var p := Vector3(
 			randf_range(WORLD_MIN.x, WORLD_MAX.x),
@@ -218,7 +223,7 @@ func _create_buffers() -> void:
 		no_path_bytes.encode_u32(0, 0xFFFFFFFF)
 		init_state[base + 9] = no_path_bytes.decode_float(0)
 		init_state[base + 10] = 0.0  # assigned_path_slot
-		init_state[base + 11] = 0.0  # reserved
+		init_state[base + 11] = float(team)  # team (0, 1, 2, or 3)
 
 
 	var init_bytes := init_state.to_byte_array()
@@ -232,10 +237,10 @@ func _create_buffers() -> void:
 	write_cursor_rid = rd.storage_buffer_create(table_size * 4)
 	sorted_indices_rid = rd.storage_buffer_create(instance_count * 4)
 
-	# Global paths: HexPaths struct per hex cell = int path_count (4B) + 4B padding + 10 Path structs (10 * 136B = 1360B) = 1368B per hex
+	# Global paths: 4 teams per hex cell. Each team-hex has HexPaths struct (1368B)
 	var num_cells := hex_total_cells if hex_total_cells > 0 else (hex_grid_width * hex_grid_depth)
 	var global_paths_bytes := PackedByteArray()
-	global_paths_bytes.resize(num_cells * 1368)
+	global_paths_bytes.resize(num_cells * 4 * 1368)
 	global_paths_rid = rd.storage_buffer_create(global_paths_bytes.size(), global_paths_bytes)
 
 	mm_buffer_rid = RenderingServer.multimesh_get_buffer_rd_rid(multimesh.get_rid())
@@ -435,24 +440,30 @@ func id_to_hex(id: int) -> Vector2i:
 	)
 var _hex_path_counts: Dictionary = {}
 
-## Set the number of available paths stored for a given hex cell.
-func set_hex_path_count(col: int, row: int, path_count: int) -> void:
+## Set the number of available paths stored for a given hex cell and team.
+func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:
+	team = clampi(team, 0, 3)
 	var hex_id := hex_to_id(col, row)
-	_hex_path_counts[hex_id] = path_count
-	var hex_offset := hex_id * 1368
+	var team_hex_key := "%d_%d" % [hex_id, team]
+	_hex_path_counts[team_hex_key] = path_count
+
+	var team_hex_idx := hex_id * 4 + team
+	var hex_offset := team_hex_idx * 1368
 	var buf := PackedByteArray()
 	buf.resize(4)
 	buf.encode_s32(0, path_count)
-	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * 1368
+	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * 4 * 1368
 	if hex_offset + 4 <= total_max:
 		rd.buffer_update(global_paths_rid, hex_offset, buf.size(), buf)
 
 
-## Write a global path of world-space Vector2 points for a hex cell and path slot.
+## Write a global path of world-space Vector2 points for a hex cell, team, and path slot.
 ## `points` is an Array of Vector2 (xz positions in main view world space).
-func set_path(points: Array, col: int = 0, row: int = 0, path_slot: int = -1, total_hex_paths: int = -1) -> void:
+func set_path(points: Array, col: int = 0, row: int = 0, team: int = 0, path_slot: int = -1, total_hex_paths: int = -1) -> void:
 	if points.is_empty():
 		return
+
+	team = clampi(team, 0, 3)
 
 	# Extract start point
 	var p0: Vector2
@@ -472,25 +483,27 @@ func set_path(points: Array, col: int = 0, row: int = 0, path_slot: int = -1, to
 		row = start_hex.y
 
 	var hex_id := hex_to_id(col, row)
+	var team_hex_key := "%d_%d" % [hex_id, team]
 
 	if path_slot < 0:
-		var current_cnt: int = _hex_path_counts.get(hex_id, 0)
+		var current_cnt: int = _hex_path_counts.get(team_hex_key, 0)
 		path_slot = current_cnt % 10
 		total_hex_paths = min(current_cnt + 1, 10)
-		_hex_path_counts[hex_id] = total_hex_paths
+		_hex_path_counts[team_hex_key] = total_hex_paths
 	else:
 		path_slot = clampi(path_slot, 0, 9)
 		if total_hex_paths < 0:
-			total_hex_paths = max(path_slot + 1, _hex_path_counts.get(hex_id, 1))
-		_hex_path_counts[hex_id] = total_hex_paths
+			total_hex_paths = max(path_slot + 1, _hex_path_counts.get(team_hex_key, 1))
+		_hex_path_counts[team_hex_key] = total_hex_paths
 
-	var hex_offset := hex_id * 1368
+	var team_hex_idx := hex_id * 4 + team
+	var hex_offset := team_hex_idx * 1368
+	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * 4 * 1368
 
-	# Update the hex's path_count
+	# Update the team-hex's path_count
 	var count_buf := PackedByteArray()
 	count_buf.resize(4)
 	count_buf.encode_s32(0, total_hex_paths)
-	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * 1368
 	if hex_offset + 4 <= total_max:
 		rd.buffer_update(global_paths_rid, hex_offset, count_buf.size(), count_buf)
 
@@ -516,3 +529,106 @@ func set_path(points: Array, col: int = 0, row: int = 0, path_slot: int = -1, to
 	var path_offset := hex_offset + 8 + path_slot * 136
 	if path_offset + buf.size() <= total_max:
 		rd.buffer_update(global_paths_rid, path_offset, buf.size(), buf)
+
+
+## Computes the four corner base rectangles for the ACTUAL grid, so every
+## team always spawns in a real corner regardless of grid_width/grid_depth.
+## Returns the world-space Vector3 center of hex cell (col, row).
+func get_hex_center(col: int, row: int) -> Vector3:
+	var SQRT_3 := sqrt(3.0)
+	var horiz_spacing := hex_size * 1.5
+	var vert_spacing := SQRT_3 * hex_size
+	var total_width := float(hex_grid_width - 1) * horiz_spacing
+	var total_depth := float(hex_grid_depth) * vert_spacing
+
+	# offset (col,row) -> axial (q,r)
+	var q := col
+	var r := row - (col - (col & 1)) / 2
+
+	# axial -> pixel (flat-top)
+	var u := hex_size * (3.0 / 2.0 * float(q))
+	var v := hex_size * (SQRT_3 / 2.0 * float(q) + SQRT_3 * float(r))
+
+	# apply mesh_scale and center offset (inverse of world_to_hex)
+	var wx := (u - total_width * 0.5) * mesh_scale
+	var wz := (v - total_depth * 0.5) * mesh_scale
+
+	return Vector3(wx, WORLD_MIN.y, wz)
+
+## Computes the four corner base rectangles for the ACTUAL grid, so every
+## team always spawns in a real corner regardless of grid_width/grid_depth.
+func _compute_team_bases() -> void:
+	var bw := 3 # base width in tiles
+	var bh := 2 # base height in tiles
+	var max_c := hex_grid_width - 1
+	var max_r := hex_grid_depth - 1
+	team_bases = [
+		[1, 1, bw, bh],                                    # team 0 - top-left
+		[max_c - bw, 1, max_c - 1, bh],                    # team 1 - top-right
+		[max_c - bw, max_r - bh, max_c - 1, max_r - 1],    # team 2 - bottom-right
+		[1, max_r - bh, bw, max_r - 1],                    # team 3 - bottom-left
+	]
+
+
+## Drops `team`'s starting units into its walled corner base.
+func _spawn_team_army(team: int) -> void:
+	# Collect spawn tiles for this team's corner base.
+	var base: Array = team_bases[team]
+	var spawn_tiles: Array = []
+	for c in range(base[0], base[2] + 1):
+		for r in range(base[1], base[3] + 1):
+			if c == base[0] and r == base[1]:
+				continue # skip the generator tile
+			spawn_tiles.append(Vector2i(c, r))
+
+	# Find all boids belonging to this team (boid i has team = i % 4).
+	var team_boids: Array = []
+	for i in range(instance_count):
+		if i % 4 == team:
+			team_boids.append(i)
+
+	var jitter := mesh_scale * 0.3
+	var floats_per_boid := 12
+
+	for bi in range(team_boids.size()):
+		var boid_id: int = team_boids[bi]
+		var cell: Vector2i = spawn_tiles[bi % spawn_tiles.size()]
+		var center := get_hex_center(cell.x, cell.y)
+		var offset := Vector3(randf_range(-jitter, jitter), randf_range(0.0, 4.0), randf_range(-jitter, jitter))
+		var pos := center + offset
+
+		var hex := world_to_hex(Vector2(pos.x, pos.z))
+		var hex_id := hex_to_id(hex.x, hex.y)
+
+		# Build a single boid row as floats, matching the state buffer layout.
+		var row := PackedFloat32Array()
+		row.resize(floats_per_boid)
+		row[0] = pos.x
+		row[1] = pos.y
+		row[2] = pos.z
+		# hex_id stored as raw uint32 reinterpreted as float
+		var hb := PackedByteArray()
+		hb.resize(4)
+		hb.encode_u32(0, hex_id)
+		row[3] = hb.decode_float(0)
+		# vel = zero
+		row[4] = 0.0
+		row[5] = 0.0
+		row[6] = 0.0
+		row[7] = 0.0
+		# state = 0
+		row[8] = 0.0
+		# assigned_path_hex = 0xFFFFFFFF (NO_PATH)
+		var np := PackedByteArray()
+		np.resize(4)
+		np.encode_u32(0, 0xFFFFFFFF)
+		row[9] = np.decode_float(0)
+		# assigned_path_slot = 0
+		row[10] = 0.0
+		# team
+		row[11] = float(team)
+
+		var buf := row.to_byte_array()
+		var byte_offset := boid_id * floats_per_boid * 4
+		for sbuf in state_buffers:
+			rd.buffer_update(sbuf, byte_offset, buf.size(), buf)

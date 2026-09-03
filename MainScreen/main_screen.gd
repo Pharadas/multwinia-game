@@ -100,7 +100,7 @@ func _ready() -> void:
 	heightmap_image.noise.seed = randi()
 	# The corner bases must exist before the first player can join, and they
 	# must follow the ACTUAL grid size - not a hardcoded layout.
-	_compute_team_bases()
+	# _compute_team_bases()
 	# Required for CollisionObject3D.input_event to fire on mouse clicks.
 	get_viewport().physics_object_picking = true
 	_disable_legacy_collision()
@@ -115,12 +115,13 @@ func _ready() -> void:
 
 
 func _on_player_joined(team: int) -> void:
-	if team < 0 or team >= team_bases.size():
-		return
-	if spawned_teams.has(team):
-		return
-	spawned_teams[team] = true
-	_spawn_team_army(team)
+	pass
+# 	if team < 0 or team >= team_bases.size():
+# 		return
+# 	if spawned_teams.has(team):
+# 		return
+# 	spawned_teams[team] = true
+# 	_spawn_team_army(team)
 
 
 func _on_drawn_path_received(points: Array, team: int) -> void:
@@ -128,31 +129,8 @@ func _on_drawn_path_received(points: Array, team: int) -> void:
 	if points.is_empty():
 		print("no points to draw path!")
 		return
-	ss.set_path(points)
+	ss.set_path(points, 0, 0, team)
 	print("Global path set: %d points for team %d" % [points.size(), team])
-
-
-## Drops `team`'s starting units into its walled corner base.
-func _spawn_team_army(team: int) -> void:
-	# Units land on the interior tiles - never on the perimeter walls, and
-	# never on the generator (it sits in the corner-most tile, which is
-	# skipped here) - so nobody drops in already trapped.
-	var base: Array = team_bases[team]
-	var spawn_tiles: Array = []
-	for c in range(base[0], base[2] + 1):
-		for r in range(base[1], base[3] + 1):
-			if c == base[0] and r == base[1]:
-				continue # the generator tile - keep the drop zone clear of it
-			spawn_tiles.append(Vector2i(c, r))
-
-	var jitter := mesh_scale * 0.3
-	var drop_height := mesh_scale * 7.5
-	for i in range(20):
-		var cell: Vector2i = spawn_tiles[i % spawn_tiles.size()]
-		var center := get_hex_center(cell.x, cell.y)
-		var offset := Vector3(randf_range(-jitter, jitter), randf_range(0.0, 4.0), randf_range(-jitter, jitter))
-		make_new_darwinian(center + offset + Vector3(0, drop_height, 0), team)
-
 
 ## The old single-mesh version of this script wrote the whole terrain's
 ## collision into a CollisionShape3D sibling (under the parent StaticBody3D).
@@ -306,23 +284,6 @@ func _clear_hexes() -> void:
 ## Returns a stable string key for a tile (used by the team-base dicts).
 static func _tile_key(col: int, row: int) -> String:
 	return "%d_%d" % [col, row]
-
-
-## Computes the four corner base rectangles for the ACTUAL grid, so every
-## team always spawns in a real corner regardless of grid_width/grid_depth.
-## Called from _ready() before anything else, so the bases exist before the
-## first player joins.
-func _compute_team_bases() -> void:
-	var bw := 3 # base width in tiles
-	var bh := 2 # base height in tiles
-	var max_c := grid_width - 1
-	var max_r := grid_depth - 1
-	team_bases = [
-		[1, 1, bw, bh],                                    # team 0 - top-left
-		[max_c - bw, 1, max_c - 1, bh],                    # team 1 - top-right
-		[max_c - bw, max_r - bh, max_c - 1, max_r - 1],    # team 2 - bottom-right
-		[1, max_r - bh, bw, max_r - 1],                    # team 3 - bottom-left
-	]
 
 
 ## Returns whichever tile in `tiles` is closest to `center`.
