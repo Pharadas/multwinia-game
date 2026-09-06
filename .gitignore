@@ -2,7 +2,7 @@
 .godot/
 /android/
 
-.apk
-.exe
-.pck
-.zip
+*.apk
+*.exe
+*.pck
+*.zip
