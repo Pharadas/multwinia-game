@@ -11,6 +11,7 @@ layout(local_size_x=1) in;
 
 void main() {
     uint total = 0;
+    // grid_dims.y = num_teams (4), grid is 2D: dims.x * dims.y * dims.z
     uint ts = uint(pc.grid_dims.x) * uint(pc.grid_dims.y) * uint(pc.grid_dims.z);
     for (uint i = 0u; i < ts; i++) {
         cell_offset.offsets[i] = total;

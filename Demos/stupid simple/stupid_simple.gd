@@ -65,10 +65,10 @@ func _ready() -> void:
 	var world_size := WORLD_MAX - WORLD_MIN
 	grid_dims = Vector3i(
 		ceili(world_size.x / CELL_SIZE),
-		ceili(world_size.y / CELL_SIZE),
+		4,  # num_teams (2D grid: x*z per team)
 		ceili(world_size.z / CELL_SIZE)
 	)
-	table_size = grid_dims.x * grid_dims.y * grid_dims.z
+	table_size = grid_dims.x * grid_dims.y * grid_dims.z  # 4 teams × x × z
 
 	# compute hex grid bounds from world corners (offset col/row space)
 	var tl = world_to_hex(Vector2(WORLD_MIN.x, WORLD_MIN.z))
@@ -88,9 +88,6 @@ func _ready() -> void:
 	_load_shaders()
 	_create_pipelines()
 	_create_buffers()
-	_compute_team_bases()
-	for t in range(4):
-		_spawn_team_army(t)
 	_build_uniform_sets()
 	_initial_dispatch()
 
@@ -165,20 +162,19 @@ func _create_buffers() -> void:
 	var cell_hexes := PackedInt32Array()
 	cell_hexes.resize(table_size)
 
-	# --- initalize grid values ---
-	for i in range(table_size):
-		var cell = Vector3(
-			i % grid_dims.x,
-			(i / grid_dims.x) % grid_dims.y,
-			i / (grid_dims.x * grid_dims.y)
-		)
-
-		var world_pos = Vector2(cell.x + 0.5, cell.y + 0.5) * CELL_SIZE + Vector2(WORLD_MIN.x, WORLD_MIN.z)
-		# Same world_to_hex call, same units, as the per-boid hex id below -
-		# no more silent /10.0 rescale between the two.
+	# --- initalize grid values (2D per-team layout) ---
+	# grid_dims.y = num_teams (4). For each team t, cells[t*xz..t*xz+xz] are
+	# that team's 2D grid. Spatial layout is the same for all teams.
+	var xz := grid_dims.x * grid_dims.z
+	for i in range(xz):
+		var cx := i % grid_dims.x
+		var cz := i / grid_dims.x
+		var world_pos = Vector2(float(cx) + 0.5, float(cz) + 0.5) * CELL_SIZE + Vector2(WORLD_MIN.x, WORLD_MIN.z)
 		var hex = world_to_hex(world_pos)
-		var id = hex_to_id(hex.x, hex.y)
-		cell_hexes[i] = id
+		var hex_id = hex_to_id(hex.x, hex.y)
+		# Write same hex mapping for all 4 teams
+		for t in range(4):
+			cell_hexes[t * xz + i] = hex_id
 
 	var cell_hexes_bytes := cell_hexes.to_byte_array()
 
@@ -186,7 +182,7 @@ func _create_buffers() -> void:
 	cell_info_rid = rd.storage_buffer_create(table_size * 4, cell_hexes_bytes)
 
 	# std430 pads {vec4 pos; vec4 vel; uint state;} to 48 bytes (rounds up to 16-byte multiple)
-	var floats_per_boid := 12  # 4 (pos) + 4 (vel) + 1 (state) + 3 padding floats
+	var floats_per_boid := 16  # 4 (pos) + 4 (vel) + 1 (state) + 3 padding floats
 	var state_bytes := instance_count * floats_per_boid * 4  # 48 bytes/boid
 
 	var init_state := PackedFloat32Array()
@@ -223,8 +219,68 @@ func _create_buffers() -> void:
 		no_path_bytes.encode_u32(0, 0xFFFFFFFF)
 		init_state[base + 9] = no_path_bytes.decode_float(0)
 		init_state[base + 10] = 0.0  # assigned_path_slot
-		init_state[base + 11] = float(team)  # team (0, 1, 2, or 3)
+		var tb := PackedByteArray()
+		tb.resize(4)
+		tb.encode_u32(0, team)
+		init_state[base + 11] = tb.decode_float(0)  # team stored as uint bit pattern
 
+		var health := PackedByteArray()
+		health.resize(4)
+		health.encode_u32(0, 1000)
+		init_state[base + 12] = health.decode_float(0)
+
+
+
+
+	# --- spawn teams into their corner bases (CPU-side, no buffer_update needed) ---
+	_compute_team_bases()
+	for team in range(4):
+		var base_arr: Array = team_bases[team]
+		var spawn_tiles: Array = []
+		for c in range(base_arr[0], base_arr[2] + 1):
+			for r in range(base_arr[1], base_arr[3] + 1):
+				if c == base_arr[0] and r == base_arr[1]:
+					continue  # skip generator tile
+				spawn_tiles.append(Vector2i(c, r))
+		var team_boids: Array = []
+		for i in range(instance_count):
+			if i % 4 == team:
+				team_boids.append(i)
+		var jitter := mesh_scale * 0.3
+		for bi in range(team_boids.size()):
+			var boid_id: int = team_boids[bi]
+			var cell: Vector2i = spawn_tiles[bi % spawn_tiles.size()]
+			var center := get_hex_center(cell.x, cell.y)
+			var offset := Vector3(randf_range(-jitter, jitter), randf_range(0.0, 4.0), randf_range(-jitter, jitter))
+			var pos := center + offset
+			var hex := world_to_hex(Vector2(pos.x, pos.z))
+			var hex_id := hex_to_id(hex.x, hex.y)
+			var b := boid_id * floats_per_boid
+			init_state[b + 0] = pos.x
+			init_state[b + 1] = pos.y
+			init_state[b + 2] = pos.z
+			var hb := PackedByteArray()
+			hb.resize(4)
+			hb.encode_u32(0, hex_id)
+			init_state[b + 3] = hb.decode_float(0)
+			init_state[b + 4] = 0.0  # vel.x
+			init_state[b + 5] = 0.0  # vel.y
+			init_state[b + 6] = 0.0  # vel.z
+			init_state[b + 7] = 0.0
+			init_state[b + 8] = 0.0  # state
+			var np := PackedByteArray()
+			np.resize(4)
+			np.encode_u32(0, 0xFFFFFFFF)
+			init_state[b + 9] = np.decode_float(0)  # assigned_path_hex = NO_PATH
+			init_state[b + 10] = 0.0  # assigned_path_slot
+			var tb := PackedByteArray()
+			tb.resize(4)
+			tb.encode_u32(0, team)
+			init_state[b + 11] = tb.decode_float(0)
+			var health := PackedByteArray()
+			health.resize(4)
+			health.encode_u32(0, 1000)
+			init_state[b + 12] = health.decode_float(0)
 
 	var init_bytes := init_state.to_byte_array()
 	#print(init_bytes)
@@ -626,7 +682,10 @@ func _spawn_team_army(team: int) -> void:
 		# assigned_path_slot = 0
 		row[10] = 0.0
 		# team
-		row[11] = float(team)
+		var _rtb := PackedByteArray()
+		_rtb.resize(4)
+		_rtb.encode_u32(0, team)
+		row[11] = _rtb.decode_float(0)
 
 		var buf := row.to_byte_array()
 		var byte_offset := boid_id * floats_per_boid * 4

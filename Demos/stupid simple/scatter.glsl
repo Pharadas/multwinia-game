@@ -1,7 +1,15 @@
 #[compute]
 #version 450
 
-struct BoidState { vec4 pos; vec4 vel; uint state; uint path_count; };
+struct BoidState {
+    vec4 pos;
+    vec4 vel;
+    uint state;
+    uint assigned_path_hex;
+    uint assigned_path_slot;
+    uint team;
+    uint health;
+};
 
 layout(set=0, binding=0, std430) buffer StateBuf { BoidState boids[]; } state;
 layout(set=0, binding=1, std430) buffer WriteCursor { uint cursor[]; } write_cursor;
@@ -15,16 +23,20 @@ layout(local_size_x=64) in;
 ivec3 get_cell(vec3 pos, vec3 world_min, float cell_size) {
     return ivec3(floor((pos - world_min) / cell_size));
 }
-uint cell_index(ivec3 cell, ivec3 dims) {
-    ivec3 c = clamp(cell, ivec3(0), dims - ivec3(1));
-    return uint(c.x + c.y * dims.x + c.z * dims.x * dims.y);
+
+uint cell_index(int team, ivec3 cell, ivec3 dims) {
+    int cx = clamp(cell.x, 0, dims.x - 1);
+    int cz = clamp(cell.z, 0, dims.z - 1);
+    return uint(team * dims.x * dims.z + cx + cz * dims.x);
 }
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uint(pc.params.y)) return;
+    if (state.boids[id].health == 0u) return;
+    int team = int(state.boids[id].team) % 4;
     ivec3 cell = get_cell(state.boids[id].pos.xyz, pc.world_min.xyz, pc.params.z);
-    uint h = cell_index(cell, pc.grid_dims.xyz);
+    uint h = cell_index(team, cell, pc.grid_dims.xyz);
     uint slot = atomicAdd(write_cursor.cursor[h], 1);
     sorted.idx[slot] = id;
 }

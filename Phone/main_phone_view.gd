@@ -109,6 +109,7 @@ var _touch_position: Vector2 = Vector2.ZERO # last known touch position, in the 
 var _draw_mode: bool = false
 var _draw_points: PackedVector2Array = []
 var _draw_line: Line2D = null
+var _drawn_paths: Array[Line2D] = []
 const DRAW_SAMPLE_COUNT := 16
 
 # Roads, keyed by an order-independent string so a drag from either end
@@ -117,6 +118,13 @@ const DRAW_SAMPLE_COUNT := 16
 # plus the routed path of hexes it passes through.
 var _connections: Dictionary = {} # key -> {"from": Vector2i, "to": Vector2i, "nodes": Array[Node], "path": Array[Vector2i]}
 var _connection_nodes: Array[Node] = [] # every Line2D/marker drawn so far, for cleanup on repopulate
+
+# --- Double-click zoom state ---
+var _last_click_cell: Vector2i = Vector2i(-1, -1)
+var _last_click_time: float = 0.0
+var _is_zoomed: bool = false
+var _zoom_tween: Tween = null
+const DOUBLE_CLICK_WINDOW := 0.35 # seconds
 
 
 func _ready() -> void:
@@ -185,7 +193,9 @@ func _on_draw_mode_toggled(pressed: bool) -> void:
 		_send_simplified_path()
 	_draw_points.clear()
 	if _draw_line:
-		_draw_line.queue_free()
+		# Keep the line visible as a completed path
+		_draw_line.default_color = Color(1.0, 0.3, 0.3, 0.6)
+		_drawn_paths.append(_draw_line)
 		_draw_line = null
 
 
@@ -587,6 +597,54 @@ func _find_path(from_cell: Vector2i, to_cell: Vector2i) -> Array:
 	return path
 
 
+## Zoom the tile_map_layer so the given hex fills the viewport.
+func _zoom_to_cell(cell: Vector2i) -> void:
+	_is_zoomed = true
+	if _zoom_tween and _zoom_tween.is_valid():
+		_zoom_tween.kill()
+	_zoom_tween = create_tween().set_parallel(true).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
+
+	var viewport_size := get_viewport_rect().size
+	var cell_pos := tile_map_layer.map_to_local(cell)
+	# Target scale: one hex tile should fill ~70% of the smaller viewport dimension
+	var tile_size := Vector2(tile_map_layer.tile_set.tile_size)
+	var hex_diameter := maxf(tile_size.x, tile_size.y)
+	var target_scale := minf(viewport_size.x, viewport_size.y) * 0.7 / hex_diameter
+
+	var target_pos := viewport_size / 2.0 - cell_pos * target_scale
+
+	_zoom_tween.tween_property(tile_map_layer, "scale", Vector2(target_scale, target_scale), 0.4)
+	_zoom_tween.tween_property(tile_map_layer, "position", target_pos, 0.4)
+
+
+## Zoom back out to show the full grid.
+func _zoom_out() -> void:
+	_is_zoomed = false
+	if _zoom_tween and _zoom_tween.is_valid():
+		_zoom_tween.kill()
+	_zoom_tween = create_tween().set_parallel(true).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
+
+	# Compute the same scale/position that _fit_to_screen would use
+	var cells := tile_map_layer.get_used_cells()
+	if cells.is_empty():
+		return
+	var min_pos := tile_map_layer.map_to_local(cells[0])
+	var max_pos := min_pos
+	for i in range(1, cells.size()):
+		var p := tile_map_layer.map_to_local(cells[i])
+		min_pos = min_pos.min(p)
+		max_pos = max_pos.max(p)
+	var tile_size := Vector2(tile_map_layer.tile_set.tile_size)
+	var grid_min := min_pos - tile_size / 2.0
+	var grid_size := (max_pos - min_pos) + tile_size
+	var viewport_size := get_viewport_rect().size
+	var target_scale := minf(viewport_size.x / grid_size.x, viewport_size.y / grid_size.y) * 0.9
+	var target_pos := viewport_size / 2.0 - (grid_min + grid_size / 2.0) * target_scale
+
+	_zoom_tween.tween_property(tile_map_layer, "scale", Vector2(target_scale, target_scale), 0.4)
+	_zoom_tween.tween_property(tile_map_layer, "position", target_pos, 0.4)
+
+
 # --- Input handling ---------------------------------------------------
 # Press (mouse or a first finger) on a cell to start a drag, drag anywhere,
 # release to resolve it:
@@ -716,7 +774,18 @@ func _end_drag() -> void:
 		return
 
 	if end_cell == start_cell:
-		# No real drag happened - fall back to a plain single-tile click.
+		# No real drag happened - check for double-click first.
+		var now := Time.get_ticks_msec() / 1000.0
+		if _is_zoomed:
+			_zoom_out()
+			return
+		if end_cell == _last_click_cell and (now - _last_click_time) < DOUBLE_CLICK_WINDOW:
+			_zoom_to_cell(end_cell)
+			_last_click_cell = Vector2i(-1, -1)
+			return
+		_last_click_cell = end_cell
+		_last_click_time = now
+		# Plain single-tile click.
 		_call_tile_function(start_cell.x, start_cell.y)
 		_send_click_over_network()
 		hex_clicked.emit(start_cell.x, start_cell.y)

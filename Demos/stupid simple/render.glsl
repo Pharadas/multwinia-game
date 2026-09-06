@@ -8,6 +8,7 @@ struct BoidState {
     uint assigned_path_hex;
     uint assigned_path_slot;
     uint team;
+    uint health;
 };
 
 struct InstanceData {
@@ -25,6 +26,14 @@ layout(local_size_x=64) in;
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uint(pc.params.y)) return;
+
+    if (state.boids[id].health == 0u) {
+        mm_buffer.instances[id].row1 = vec4(0.0);
+        mm_buffer.instances[id].row2 = vec4(0.0);
+        mm_buffer.instances[id].row3 = vec4(0.0);
+        mm_buffer.instances[id].color = vec4(0.0);
+        return;
+    }
 
     vec3 pos = state.boids[id].pos.xyz;
     vec3 vel = state.boids[id].vel.xyz;
