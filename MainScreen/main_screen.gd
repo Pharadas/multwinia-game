@@ -112,6 +112,8 @@ func _ready() -> void:
 	var socket := get_node_or_null("Socket")
 	if socket and socket.has_signal("drawn_path_received"):
 		socket.drawn_path_received.connect(_on_drawn_path_received)
+	if socket and socket.has_signal("building_placed_remote"):
+		socket.building_placed_remote.connect(_on_building_placed_remote)
 
 
 func _on_player_joined(team: int) -> void:
@@ -131,6 +133,41 @@ func _on_drawn_path_received(points: Array, team: int) -> void:
 		return
 	ss.set_path(points, 0, 0, team)
 	print("Global path set: %d points for team %d" % [points.size(), team])
+
+
+## A phone dropped a building on a sub-hex of hex (col, row). Spawn the 3D
+## mesh via HexBuildingManager and update the GPU cell_info buffer, creating
+## the manager on first use.
+func _on_building_placed_remote(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team: int) -> void:
+	var mgr := get_node_or_null("HexBuildingManager")
+	if not mgr:
+		mgr = HexBuildingManager.new()
+		mgr.name = "HexBuildingManager"
+		mgr.hex_size = hex_size
+		mgr.mesh_scale = mesh_scale
+		# ".." resolves to THIS node once the manager is added as a child -
+		# "." would resolve to the manager itself, which broke placement.
+		mgr.terrain_path = NodePath("..")
+		add_child(mgr)
+	var node: Node3D = mgr.place_building(col, row, sub_q, sub_r, building_id, team)
+
+	# Push the building into the GPU cell_info buffer (sim.glsl reads it).
+	_push_building_to_cell_info(col, row, sub_q, sub_r, building_id, team, node)
+
+
+## Computes the building's world position the same way HexBuildingManager
+## does and writes packed info into the cell covering that position.
+func _push_building_to_cell_info(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team: int, node: Node3D) -> void:
+	var ss_node := get_node_or_null("StupidSimple")
+	if not ss_node or ss_node.get_child_count() == 0:
+		return
+	var ss = ss_node.get_child(0)
+	if not ss.has_method("set_cell_building"):
+		return
+	# The manager positions the building at hex_center + sub_offset, so
+	# node.global_position IS the world position to resolve to a grid cell.
+	var wp := node.global_position
+	ss.set_cell_building(Vector2(wp.x, wp.z), building_id, team, sub_q, sub_r)
 
 ## The old single-mesh version of this script wrote the whole terrain's
 ## collision into a CollisionShape3D sibling (under the parent StaticBody3D).

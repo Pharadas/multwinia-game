@@ -57,8 +57,19 @@ var hex_total_cells := 0
 var frame_parity := 0
 var team_bases: Array = []
 
+## Cumulative simulated seconds, pushed to all shaders as params.w. Used by
+## sim.glsl to check path expiry timestamps.
+var _elapsed_seconds: float = 0.0
+
+## How long a freshly-set path stays claimable, in seconds. Claimant boids
+## finish their path regardless of expiry (see sim.glsl soft-expiry comment).
+@export var path_lifetime := 30.0
+
 
 func _ready() -> void:
+	# The scene ships with instance_count = 0 so Godot doesn't serialize the
+	# whole instance buffer into the .tscn on save. Allocate the real count
+	# here — the GPU render pass fills every instance every frame anyway.
 	instance_count = multimesh.instance_count
 	total_groups = ceili(instance_count / 64.0)
 
@@ -159,8 +170,16 @@ func _create_pipelines() -> void:
 
 
 func _create_buffers() -> void:
+	# Cell info: TWO uints per grid cell (hex id + packed building info),
+	# replicated across all 4 team slices. Building field layout must match
+	# sim.glsl's CellInfo:
+	#   bits  0-7 : building id (0 = none? no - 0 = castle; 255 = none)
+	#   bits  8-15: owning team
+	#   bits 16-23: sub_q + 3
+	#   bits 24-31: sub_r + 3
 	var cell_hexes := PackedInt32Array()
-	cell_hexes.resize(table_size)
+	cell_hexes.resize(table_size * 2)  # [hex_id, building] pairs
+	var building_none := 0xFF  # "no building" sentinel
 
 	# --- initalize grid values (2D per-team layout) ---
 	# grid_dims.y = num_teams (4). For each team t, cells[t*xz..t*xz+xz] are
@@ -172,14 +191,16 @@ func _create_buffers() -> void:
 		var world_pos = Vector2(float(cx) + 0.5, float(cz) + 0.5) * CELL_SIZE + Vector2(WORLD_MIN.x, WORLD_MIN.z)
 		var hex = world_to_hex(world_pos)
 		var hex_id = hex_to_id(hex.x, hex.y)
-		# Write same hex mapping for all 4 teams
+		# Write same hex mapping (and empty building) for all 4 teams
 		for t in range(4):
-			cell_hexes[t * xz + i] = hex_id
+			var ci := t * xz + i
+			cell_hexes[ci * 2] = hex_id
+			cell_hexes[ci * 2 + 1] = building_none
 
 	var cell_hexes_bytes := cell_hexes.to_byte_array()
 
 	#print(len(cell_hexes_bytes), " ", table_size)
-	cell_info_rid = rd.storage_buffer_create(table_size * 4, cell_hexes_bytes)
+	cell_info_rid = rd.storage_buffer_create(table_size * 8, cell_hexes_bytes)
 
 	# std430 pads {vec4 pos; vec4 vel; uint state;} to 48 bytes (rounds up to 16-byte multiple)
 	var floats_per_boid := 16  # 4 (pos) + 4 (vel) + 1 (state) + 3 padding floats
@@ -355,13 +376,13 @@ func _build_uniform_sets() -> void:
 
 func _build_push_constants(delta: float) -> PackedByteArray:
 	# Must match the GLSL struct exactly, in all 5 shaders:
-	# vec4 params      (dt, instance_count, cell_size, unused)
+	# vec4 params      (dt, instance_count, cell_size, elapsed sim seconds)
 	# vec4 world_min   (x, y, z, unused)
 	# ivec4 grid_dims  (x, y, z, unused)
 	# vec4 hex_params  (hex_size, mesh_scale, min_q, min_r)
 	# ivec4 hex_grid   (grid_width, grid_depth, hex_width, -)
 	var floats := PackedFloat32Array([
-		delta, float(instance_count), CELL_SIZE, 0.0,
+		delta, float(instance_count), CELL_SIZE, _elapsed_seconds,
 		WORLD_MIN.x, WORLD_MIN.y, WORLD_MIN.z, 0.0,
 	])
 	var bytes := floats.to_byte_array()
@@ -381,6 +402,7 @@ func _build_push_constants(delta: float) -> PackedByteArray:
 
 
 func _process(delta: float) -> void:
+	_elapsed_seconds += delta
 	var read_i = frame_parity
 	var write_i = 1 - frame_parity
 
@@ -496,6 +518,36 @@ func id_to_hex(id: int) -> Vector2i:
 	)
 var _hex_path_counts: Dictionary = {}
 
+## Writes the packed building info into the cell_info buffer for the grid
+## cell containing `world_pos` (XZ). Replicated across all 4 team slices.
+## building_id 0 = castle, 1 = tower, 2 = wall; pass -1 to clear.
+## Layout must match sim.glsl's CellInfo comments.
+func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: int, sub_r: int) -> void:
+	var packed: int
+	if building_id < 0:
+		packed = 0xFF  # "none"
+	else:
+		packed = (building_id & 0xFF) \
+			| ((team & 0xFF) << 8) \
+			| ((clampi(sub_q, -3, 4) + 3 & 0xFF) << 16) \
+			| ((clampi(sub_r, -3, 4) + 3 & 0xFF) << 24)
+
+	# Which grid cell does this building's center fall in?
+	var cx := int(floor((world_pos.x - WORLD_MIN.x) / CELL_SIZE))
+	var cz := int(floor((world_pos.y - WORLD_MIN.y) / CELL_SIZE))
+	cx = clampi(cx, 0, grid_dims.x - 1)
+	cz = clampi(cz, 0, grid_dims.z - 1)
+
+	var cell_idx := cx + cz * grid_dims.x
+	var xz := grid_dims.x * grid_dims.z
+	var buf := PackedByteArray()
+	buf.resize(4)
+	buf.encode_u32(0, packed)
+	# One 4-byte update per team slice (they're not contiguous).
+	for t in range(4):
+		var byte_off := (t * xz + cell_idx) * 8 + 4  # skip hex_id, write building
+		rd.buffer_update(cell_info_rid, byte_off, 4, buf)
+
 ## Set the number of available paths stored for a given hex cell and team.
 func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:
 	team = clampi(team, 0, 3)
@@ -563,7 +615,10 @@ func set_path(points: Array, col: int = 0, row: int = 0, team: int = 0, path_slo
 	if hex_offset + 4 <= total_max:
 		rd.buffer_update(global_paths_rid, hex_offset, count_buf.size(), count_buf)
 
-	# GLSL layout for Path struct: vec2 points[16] (128 bytes) + int count (4 bytes) = 132, padded to 136
+	# GLSL layout for Path struct: vec2 points[16] (128 bytes) + int count (4)
+	# + float expiry (4) = 136-byte stride. expiry is the elapsed-sim-time
+	# deadline after which NEW boids can't claim the path (boids that already
+	# claimed it finish it regardless). <= 0 means never expires.
 	var buf := PackedByteArray()
 	buf.resize(136)
 	var count := mini(points.size(), 16)
@@ -581,6 +636,8 @@ func set_path(points: Array, col: int = 0, row: int = 0, team: int = 0, path_slo
 		buf.encode_float(i * 8 + 4, p.y)
 	# int count at byte offset 128
 	buf.encode_s32(128, count)
+	# float expiry at byte offset 132 (was std430 padding)
+	buf.encode_float(132, _elapsed_seconds + path_lifetime if path_lifetime > 0.0 else 0.0)
 
 	var path_offset := hex_offset + 8 + path_slot * 136
 	if path_offset + buf.size() <= total_max:

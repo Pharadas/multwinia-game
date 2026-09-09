@@ -119,11 +119,14 @@ const DRAW_SAMPLE_COUNT := 16
 var _connections: Dictionary = {} # key -> {"from": Vector2i, "to": Vector2i, "nodes": Array[Node], "path": Array[Vector2i]}
 var _connection_nodes: Array[Node] = [] # every Line2D/marker drawn so far, for cleanup on repopulate
 
-# --- Double-click zoom state ---
+# --- Hex detail view state ---
+var _detail_view: HexDetailView = null
+## Buildings placed per parent hex: Vector2i(col,row) -> {Vector2i(sub_q,sub_r) -> building_id}
+var _hex_buildings: Dictionary = {}
+## Node2D child of tile_map_layer that draws building markers on the grid.
+var _building_marker_layer: Node2D = null
 var _last_click_cell: Vector2i = Vector2i(-1, -1)
 var _last_click_time: float = 0.0
-var _is_zoomed: bool = false
-var _zoom_tween: Tween = null
 const DOUBLE_CLICK_WINDOW := 0.35 # seconds
 
 
@@ -595,55 +598,90 @@ func _find_path(from_cell: Vector2i, to_cell: Vector2i) -> Array:
 		path.append(cur)
 	path.reverse()
 	return path
+## Opens the full-screen HexDetailView for `cell` - a standalone "scene"
+## showing that hex as a honeycomb of sub-hexagons, tinted with the hex's
+## own color. Back returns to the grid view.
+func _open_hex_detail(cell: Vector2i) -> void:
+	if _detail_view and is_instance_valid(_detail_view):
+		_detail_view.queue_free()
+		_detail_view = null
+
+	var color = _get_tile_color(cell.x, cell.y)
+	if color == null:
+		color = Color(0.4, 0.6, 0.8)
+	var is_wall: bool = _get_tile_is_wall(cell.x, cell.y)
+
+	_detail_view = HexDetailView.new()
+	_detail_view.setup(cell.x, cell.y, color, is_wall)
+	_detail_view.z_index = 100
+	_detail_view.back_pressed.connect(_close_hex_detail)
+	_detail_view.building_placed.connect(_on_building_placed)
+	# Restore any buildings previously placed in this hex (local + synced).
+	var saved: Dictionary = _hex_buildings.get(cell, {})
+	if not saved.is_empty():
+		_detail_view.set_buildings(saved)
+	add_child(_detail_view)
 
 
-## Zoom the tile_map_layer so the given hex fills the viewport.
-func _zoom_to_cell(cell: Vector2i) -> void:
-	_is_zoomed = true
-	if _zoom_tween and _zoom_tween.is_valid():
-		_zoom_tween.kill()
-	_zoom_tween = create_tween().set_parallel(true).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
-
-	var viewport_size := get_viewport_rect().size
-	var cell_pos := tile_map_layer.map_to_local(cell)
-	# Target scale: one hex tile should fill ~70% of the smaller viewport dimension
-	var tile_size := Vector2(tile_map_layer.tile_set.tile_size)
-	var hex_diameter := maxf(tile_size.x, tile_size.y)
-	var target_scale := minf(viewport_size.x, viewport_size.y) * 0.7 / hex_diameter
-
-	var target_pos := viewport_size / 2.0 - cell_pos * target_scale
-
-	_zoom_tween.tween_property(tile_map_layer, "scale", Vector2(target_scale, target_scale), 0.4)
-	_zoom_tween.tween_property(tile_map_layer, "position", target_pos, 0.4)
-
-
-## Zoom back out to show the full grid.
-func _zoom_out() -> void:
-	_is_zoomed = false
-	if _zoom_tween and _zoom_tween.is_valid():
-		_zoom_tween.kill()
-	_zoom_tween = create_tween().set_parallel(true).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
-
-	# Compute the same scale/position that _fit_to_screen would use
-	var cells := tile_map_layer.get_used_cells()
-	if cells.is_empty():
+## A building was dropped on sub-hex (sub_q, sub_r) of the open hex. Remember
+## it locally and forward it to the main screen, which spawns the 3D mesh.
+func _on_building_placed(sub_q: int, sub_r: int, building_id: int) -> void:
+	if not _detail_view:
 		return
-	var min_pos := tile_map_layer.map_to_local(cells[0])
-	var max_pos := min_pos
-	for i in range(1, cells.size()):
-		var p := tile_map_layer.map_to_local(cells[i])
-		min_pos = min_pos.min(p)
-		max_pos = max_pos.max(p)
-	var tile_size := Vector2(tile_map_layer.tile_set.tile_size)
-	var grid_min := min_pos - tile_size / 2.0
-	var grid_size := (max_pos - min_pos) + tile_size
-	var viewport_size := get_viewport_rect().size
-	var target_scale := minf(viewport_size.x / grid_size.x, viewport_size.y / grid_size.y) * 0.9
-	var target_pos := viewport_size / 2.0 - (grid_min + grid_size / 2.0) * target_scale
+	var cell := Vector2i(_detail_view.hex_col, _detail_view.hex_row)
+	var buildings: Dictionary = _hex_buildings.get(cell, {})
+	buildings[Vector2i(sub_q, sub_r)] = building_id
+	_hex_buildings[cell] = buildings
+	_update_building_markers()
 
-	_zoom_tween.tween_property(tile_map_layer, "scale", Vector2(target_scale, target_scale), 0.4)
-	_zoom_tween.tween_property(tile_map_layer, "position", target_pos, 0.4)
+	var socket := _get_socket_node()
+	if socket and socket.has_method("send_building_placed"):
+		socket.send_building_placed(cell.x, cell.y, sub_q, sub_r, building_id, team_number)
 
+
+## Rebuilds (or creates) the Node2D that draws a small hexagonal marker on
+## every parent hex that has buildings - one marker per building, colored
+## like the building and positioned at its sub-hex location within the hex.
+func _update_building_markers() -> void:
+	if not tile_map_layer:
+		return
+	if not _building_marker_layer or not is_instance_valid(_building_marker_layer):
+		_building_marker_layer = Node2D.new()
+		_building_marker_layer.name = "BuildingMarkers"
+		tile_map_layer.add_child(_building_marker_layer)
+
+	var layer := _building_marker_layer
+	layer.queue_redraw()
+	# Rebind the draw callback to the latest data (replacing any old one).
+	layer.draw.connect(func():
+		var tile_sz := Vector2(tile_map_layer.tile_set.tile_size)
+		var hex_r: float = tile_sz.x / 2.0
+		var sub_r: float = hex_r / 4.0  # 3-ring honeycomb spans ~4 sub radii
+		for hex_cell in _hex_buildings:
+			var buildings: Dictionary = _hex_buildings[hex_cell]
+			var base := tile_map_layer.map_to_local(hex_cell)
+			for sub_cell in buildings:
+				var bid: int = buildings[sub_cell]
+				var q = sub_cell.x
+				var r = sub_cell.y
+				var off := Vector2(sub_r * 1.5 * float(q), sub_r * sqrt(3.0) * (float(r) + float(q) * 0.5))
+				_draw_small_hex(layer, base + off, sub_r * 0.9, HexDetailView.BUILDING_COLORS.get(bid, Color.WHITE))
+	, CONNECT_REFERENCE_COUNTED)
+
+
+static func _draw_small_hex(target: CanvasItem, center: Vector2, r: float, color: Color) -> void:
+	var pts := PackedVector2Array()
+	for i in range(6):
+		var a := deg_to_rad(60.0 * float(i))
+		pts.append(center + Vector2(cos(a), sin(a)) * r)
+	target.draw_colored_polygon(pts, color)
+
+
+## Removes the hex detail view and returns to the grid.
+func _close_hex_detail() -> void:
+	if _detail_view and is_instance_valid(_detail_view):
+		_detail_view.queue_free()
+	_detail_view = null
 
 # --- Input handling ---------------------------------------------------
 # Press (mouse or a first finger) on a cell to start a drag, drag anywhere,
@@ -656,6 +694,10 @@ func _zoom_out() -> void:
 # motion/drag input events.
 func _unhandled_input(event: InputEvent) -> void:
 	if not tile_map_layer:
+		return
+	# While the hex detail view is open, the grid ignores all input -
+	# the detail view's own back button is the only way out.
+	if _detail_view and is_instance_valid(_detail_view):
 		return
 
 	if event is InputEventScreenTouch:
@@ -700,6 +742,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_draw_points.clear()
 				_draw_points.append(tile_map_layer.to_local(event.position))
 				_ensure_draw_line()
+			else:
+				_start_drag()
 		else:
 			if _draw_mode:
 				if _draw_points.size() >= 2:
@@ -711,6 +755,8 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _process(_delta: float) -> void:
 	if not tile_map_layer:
+		return
+	if _detail_view and is_instance_valid(_detail_view):
 		return
 
 	# In draw mode with mouse held, capture mouse motion as draw points
@@ -772,20 +818,17 @@ func _end_drag() -> void:
 
 	if not _cell_in_bounds(end_cell):
 		return
-
 	if end_cell == start_cell:
-		# No real drag happened - check for double-click first.
+		print("gaming time")
+		# No real drag — check for double-click to open the hex detail view.
 		var now := Time.get_ticks_msec() / 1000.0
-		if _is_zoomed:
-			_zoom_out()
-			return
 		if end_cell == _last_click_cell and (now - _last_click_time) < DOUBLE_CLICK_WINDOW:
-			_zoom_to_cell(end_cell)
 			_last_click_cell = Vector2i(-1, -1)
+			_open_hex_detail(end_cell)
 			return
 		_last_click_cell = end_cell
 		_last_click_time = now
-		# Plain single-tile click.
+		# Plain single-click.
 		_call_tile_function(start_cell.x, start_cell.y)
 		_send_click_over_network()
 		hex_clicked.emit(start_cell.x, start_cell.y)

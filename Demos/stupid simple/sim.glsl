@@ -21,7 +21,25 @@ layout(set=0, binding=1, std430) buffer WriteState { BoidState boids[]; } write_
 layout(set=0, binding=2, std430) buffer CellOffset { uint offsets[]; } cell_offset;
 layout(set=0, binding=3, std430) buffer CellCount { uint counts[]; } cell_count;
 layout(set=0, binding=4, std430) buffer SortedIdx { uint idx[]; } sorted;
-layout(set=0, binding=5, std430) buffer CellInfo { uint idx[]; } cell_info;
+
+// Per grid cell: which hex it belongs to + the building sitting in it.
+// `building` is 0 when the cell has no building, otherwise packed:
+//   bits  0-7 : building id (0 = castle, 1 = tower, 2 = wall)
+//   bits  8-15: owning team
+//   bits 16-23: sub_q + 3 (axial sub-hex coord inside the parent hex, -3..3)
+//   bits 24-31: sub_r + 3
+// The building whose CENTER falls in this grid cell is the one stored here;
+// the same info is replicated across all 4 team slices.
+struct CellInfo {
+    uint hex_id;
+    uint building;
+};
+layout(set=0, binding=5, std430) buffer CellInfoBuf { CellInfo cells[]; } cell_info;
+
+uint cell_building_id(uint packed_info)  { return packed_info & 0xFFu; }
+uint cell_building_team(uint packed_info){ return (packed_info >> 8u) & 0xFFu; }
+int  cell_building_sub_q(uint packed_info) { return int((packed_info >> 16u) & 0xFFu) - 3; }
+int  cell_building_sub_r(uint packed_info) { return int((packed_info >> 24u) & 0xFFu) - 3; }
 
 struct Path {
     vec2 points[16];
@@ -134,6 +152,11 @@ void main() {
     uint assigned_hex = read_s.boids[id].assigned_path_hex;
     uint assigned_slot = read_s.boids[id].assigned_path_slot;
 
+    // Building occupying the grid cell this boid is in (0 = none).
+    uint cell_ci = cell_index_2d(0, my_cell, dims);  // building info is the same on every team slice
+    uint my_building = cell_building_id(cell_info.cells[cell_ci].building);
+    uint my_building_team = cell_building_team(cell_info.cells[cell_ci].building);
+
     if (read_s.boids[id].health <= 0) {
         write_s.boids[id].pos = vec4(0.0, 0.0, 0.0, float(my_team));
         write_s.boids[id].vel = vec4(0.0);
@@ -192,6 +215,8 @@ void main() {
 
     // --- ENEMY COMBAT & REPULSION ---
     int nearby_enemies = 0;
+    vec3 closest_enemy_pos = vec3(1000000.0);
+
     for (int t = 0; t < 4; t++) {
         if (t == my_team) continue;
         for (int c = 0; c < 9; c++) {
@@ -209,15 +234,67 @@ void main() {
                 uint other_id = sorted.idx[start + idx];
                 vec3 other_pos = read_s.boids[other_id].pos.xyz;
                 float d = distance(pos, other_pos);
-                if (d < perception && d > 0.001) {
+                if (d < 0.5) {
+                    // enemies close enough to attack this dot
                     nearby_enemies++;
+                }
+                if (d < length(closest_enemy_pos)) {
+                    closest_enemy_pos = other_pos;
                 }
             }
         }
     }
 
     if (nearby_enemies > 0) {
+        accel += normalize(closest_enemy_pos - pos) * 8.0;
         accel *= 0.5;
+    }
+
+    // --- BUILDING DETECTION ---
+    // Scan a 2-cell ring (5x5 block) of the cell_info buffer for buildings
+    // owned by OTHER teams. Buildings are static so a wider scan than the
+    // boid search is cheap. Track the closest one; its grid cell center is
+    // close enough to the building's world position (the building is placed
+    // AT its sub-hex center, which falls inside that grid cell).
+    const int BUILD_SCAN = 2;  // cells in each direction
+    float closest_bldg_d = 1e10;
+    vec3 closest_bldg_pos = vec3(0.0);
+    uint closest_bldg_id = 0u;
+    uint closest_bldg_team = 0u;
+
+    for (int bdx = -BUILD_SCAN; bdx <= BUILD_SCAN; bdx++) {
+        for (int bdz = -BUILD_SCAN; bdz <= BUILD_SCAN; bdz++) {
+            ivec3 bc = my_cell + ivec3(bdx, 0, bdz);
+            if (bc.x < 0 || bc.x >= dims.x || bc.z < 0 || bc.z >= dims.z) continue;
+            uint bci = cell_index_2d(0, bc, dims);
+            uint packed_b = cell_info.cells[bci].building;
+            uint bid = cell_building_id(packed_b);
+            if (bid == 0xFFu) continue;  // no building in this cell
+            uint bteam = cell_building_team(packed_b);
+            if (int(bteam) == my_team) continue;  // friendly - ignore
+            // Building center = the grid cell's world-space center.
+            vec3 bp = pc.world_min.xyz + vec3(float(bc.x) + 0.5, 0.0, float(bc.z) + 0.5) * cell_size;
+            float d = distance(pos.xz, bp.xz);
+            if (d < closest_bldg_d) {
+                closest_bldg_d = d;
+                closest_bldg_pos = bp;
+                closest_bldg_id = bid;
+                closest_bldg_team = bteam;
+            }
+        }
+    }
+
+    // ATTACK BUILDING: no mobile enemies around but a hostile building is in
+    // detection range (4x perception) - march on it and rally at its walls.
+    // Mobile enemies take priority (handled above). Boids don't deal building
+    // damage yet (no building HP on the GPU).
+    if (nearby_enemies == 0 && closest_bldg_d < perception * 4.0) {
+        vec3 to_bldg = closest_bldg_pos - pos;
+        to_bldg.y = 0.0;
+        float bd = length(to_bldg);
+        if (bd > 0.001) {
+            accel += normalize(to_bldg) * 5.0;
+        }
     }
 
     // 1. If boid has no path assigned, look at its current hex for team paths

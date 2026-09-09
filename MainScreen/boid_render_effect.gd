@@ -137,7 +137,11 @@ func _draw_view(scene_buffers: RenderSceneBuffersRD, scene_data: RenderSceneData
 	_rd.draw_list_bind_render_pipeline(draw_list, _pipeline_rid)
 	_rd.draw_list_bind_uniform_set(draw_list, _uniform_set_rid, 0)
 	_rd.draw_list_bind_vertex_array(draw_list, _vertex_array_rid)
-	_rd.draw_list_draw(draw_list, false, 4, _dot_count)
+	# instances = _dot_count: draw one quad (4-vertex triangle-strip from the
+	# bound vertex buffer) per dot. The old call had the args swapped —
+	# instances=4 and procedural_vertex_count=_dot_count — so only 4 dots
+	# were ever rendered regardless of army size.
+	_rd.draw_list_draw(draw_list, false, _dot_count)
 	_rd.draw_list_end()
 
 

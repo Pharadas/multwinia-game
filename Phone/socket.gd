@@ -242,3 +242,10 @@ func send_clear_roads(team_number: int) -> void:
 func send_drawn_path(points: Array, team_number: int, ref_cells: Array = [], ref_locals: Array = []) -> void:
 	if _peer and _was_connected:
 		_peer.put_var({"type": "drawn_path", "points": points, "team": team_number, "ref_cells": ref_cells, "ref_locals": ref_locals})
+
+## Called by HexDetailView when a building is dropped on a sub-hex. Sub-hex
+## coordinates are axial (q, r) within the parent hex's own honeycomb; the
+## main screen places the 3D mesh inside that hex accordingly.
+func send_building_placed(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team_number: int) -> void:
+	if _peer and _was_connected:
+		_peer.put_var({"type": "building_placed", "col": col, "row": row, "sub_q": sub_q, "sub_r": sub_r, "building": building_id, "team": team_number})
