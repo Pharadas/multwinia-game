@@ -114,6 +114,42 @@ func _ready() -> void:
 		socket.drawn_path_received.connect(_on_drawn_path_received)
 	if socket and socket.has_signal("building_placed_remote"):
 		socket.building_placed_remote.connect(_on_building_placed_remote)
+	# The sim node is instanced with the scene, but its script child may not
+	# exist yet during _ready - defer so the connection always lands.
+	call_deferred("_connect_sim_signals")
+
+
+## Hooks the GPU sim's economy signals (see stupid_simple.gd).
+func _connect_sim_signals() -> void:
+	var ss_node := get_node_or_null("StupidSimple")
+	if ss_node == null or ss_node.get_child_count() == 0:
+		return
+	var ss = ss_node.get_child(0)
+	if ss.has_signal("mine_collapsed") and not ss.mine_collapsed.is_connected(_on_mine_collapsed):
+		ss.mine_collapsed.connect(_on_mine_collapsed)
+
+
+## A depleted mine's ground tile collapsed: remove the building mesh and
+## destroy the hex tile itself. The GPU sim already dropped every boid that
+## was standing on it (they fell and died - see sim.glsl's collapse block).
+func _on_mine_collapsed(cell: Vector2i, world_pos: Vector2) -> void:
+	# The signal carries the GPU grid cell; find the hex tile nearest its
+	# world position (robust against any cell/hex indexing mismatch).
+	var best: HexTile = null
+	var best_d := INF
+	for key in hex_nodes.keys():
+		var tile: HexTile = hex_nodes[key]
+		var d := tile.global_position.distance_squared_to(Vector3(world_pos.x, tile.global_position.y, world_pos.y))
+		if d < best_d:
+			best_d = d
+			best = tile
+	if best == null:
+		return
+	var mgr := get_node_or_null("HexBuildingManager")
+	if mgr and mgr.has_method("clear_hex"):
+		mgr.clear_hex(best.col, best.row)
+	hex_nodes.erase(Vector2i(best.col, best.row))
+	best.queue_free()
 
 
 func _on_player_joined(team: int) -> void:
@@ -214,7 +250,7 @@ func _push_building_to_cell_info(col: int, row: int, building_id: int, team: int
 	if not ss.has_method("set_cell_building"):
 		return
 	# node.global_position IS the hex center (the manager places it there);
-	# resolve that to its grid cell.
+	# resolve that to its grid cell. set_cell_building takes the XZ plane.
 	var wp := node.global_position
 	ss.set_cell_building(Vector2(wp.x, wp.z), building_id, team, 0, 0, built)
 

@@ -6,7 +6,13 @@
 #define STATE_HAS_PATH 0x00000004u
 #define STATE_FIGHTING 0x00000008u
 #define STATE_BUILDING 0x00000010u
+#define STATE_FALLING 0x00000020u
 #define NO_PATH 0xFFFFFFFFu
+
+// Building ids - must match stupid_simple.gd / hex_building_manager.gd
+#define BUILDING_BARRACK 0u
+#define BUILDING_MINE    1u
+#define BUILDING_WALL    2u
 
 struct BoidState {
     vec4 pos;
@@ -54,6 +60,10 @@ bool cell_building_is_built(uint packed_info) { return (packed_info & BUILDING_B
 struct Path {
     vec2 points[16];
     int count;
+    // Elapsed-sim-time deadline after which NEW boids can't claim this path
+    // (boids already following it finish regardless). Written by the CPU at
+    // byte offset 132 of the 136-byte Path record. <= 0 = never expires.
+    float expiry;
 };
 
 struct HexPaths {
@@ -77,6 +87,14 @@ layout(set=0, binding=6, std430) buffer GlobalPathsBuf {
 // same buffer in the same frame, so there are no races.
 layout(set=0, binding=7, std430) buffer DmgWrite { uint dmg[]; } dmg_write;
 layout(set=0, binding=8, std430) buffer DmgRead { uint dmg[]; } dmg_read;
+
+// Per-team economy, CPU-managed: [t*2+0] = resources, [t*2+1] = starve flag
+// (1 = the team couldn't pay upkeep - its boids slowly lose health).
+layout(set=0, binding=9, std430) buffer EconResBuf { uint econ_res[]; } econ_res;
+
+// Per grid cell (xz, no team slices): 1 = the ground tile here collapsed
+// (a depleted mine) - boids standing on it fall and die.
+layout(set=0, binding=10, std430) buffer CollapseBuf { uint flags[]; } collapse_buf;
 
 layout(push_constant) uniform PC {
     vec4 params; vec4 world_min; ivec4 grid_dims;
@@ -232,6 +250,50 @@ void main() {
         write_s.boids[id].vel = vec4(0.0);
         write_s.boids[id].team = uint(my_team);
         write_s.boids[id].health = 0;
+        return;
+    }
+
+    // --- MINE CAPTURE: standing on an enemy-built mine flips it to us ---
+    if (my_building == BUILDING_MINE && my_building_team != uint(my_team)) {
+        uint ci_cap = cell_index_2d(0, my_cell, dims);
+        uint packed_now = cell_info.cells[ci_cap].building;
+        // Re-check under the atomic: the owner may have changed since the
+        // read above (another team's boid captured it this same frame).
+        if (cell_building_id(packed_now) == BUILDING_MINE
+            && cell_building_is_built(packed_now)
+            && cell_building_team(packed_now) != uint(my_team)) {
+            uint captured = (packed_now & ~(0xFFu << 8u)) | ((uint(my_team) & 0xFFu) << 8u);
+            atomicExchange(cell_info.cells[ci_cap].building, captured);
+        }
+    }
+
+    // --- TILE COLLAPSE: the ground in this cell is gone - fall and die ---
+    bool falling = (state & STATE_FALLING) != 0u;
+    if (!falling) {
+        int cfx = clamp(my_cell.x, 0, dims.x - 1);
+        int cfz = clamp(my_cell.z, 0, dims.z - 1);
+        if (collapse_buf.flags[cfx + cfz * dims.x] != 0u) {
+            falling = true;
+            state = (state & ~uint(STATE_HAS_PATH)) | STATE_FALLING;
+            assigned_hex = NO_PATH;  // a path over a collapsed hole is dead
+            vel = vec3(0.0, -1.0, 0.0);
+        }
+    }
+    if (falling) {
+        // Pure ballistic fall: no flocking, no combat, no pathing. Once the
+        // boid drops below the world floor it dies (render culls health==0).
+        vel.y -= 9.8 * pc.params.x;
+        pos += vel * pc.params.x;
+        uint hp = read_s.boids[id].health;
+        if (pos.y < pc.world_min.y - 2.0) hp = 0u;
+        write_s.boids[id].pos = vec4(pos, float(my_team));
+        write_s.boids[id].vel = vec4(vel, 0.0);
+        write_s.boids[id].state = state;
+        write_s.boids[id].assigned_path_hex = assigned_hex;
+        write_s.boids[id].assigned_path_slot = assigned_slot;
+        write_s.boids[id].team = uint(my_team);
+        write_s.boids[id].home_hex = home_hex;
+        write_s.boids[id].health = hp;
         return;
     }
 
@@ -538,14 +600,25 @@ void main() {
             if (hash(id * 77u + 13u) < chance) {
                 target_hex = my_hex;
             }
-        }
-
-        if (target_hex >= 0) {
+        }        if (target_hex >= 0) {
             int t_hex_idx = target_hex * 4 + my_team;
             int total_paths = global_paths.hex_paths[t_hex_idx].path_count;
+
             int active_count = min(total_paths, 10);
-            uint chosen = id % uint(active_count);
-            if (global_paths.hex_paths[t_hex_idx].paths[chosen].count > 0) {
+            // SHORT-LIVED PATHS: skip expired paths - a fresh claim can only
+            // pick a path whose expiry hasn't passed. Boids ALREADY following
+            // a path are unaffected (checked once at claim time).
+            uint chosen = uint(active_count);
+            for (int cand = 0; cand < active_count; cand++) {
+                uint slot_c = uint((id + cand) % active_count);
+                if (global_paths.hex_paths[t_hex_idx].paths[slot_c].count <= 0) continue;
+                float exp = global_paths.hex_paths[t_hex_idx].paths[slot_c].expiry;
+                if (exp > 0.0 && pc.params.w > exp) continue;  // expired
+                chosen = slot_c;
+                break;
+            }
+            if (chosen < uint(active_count)
+                && global_paths.hex_paths[t_hex_idx].paths[chosen].count > 0) {
                 assigned_hex = uint(target_hex);
                 assigned_slot = chosen;
             }
@@ -684,6 +757,43 @@ void main() {
         vel.xz = vec2(0.0);  // dampen on bounce
     }
 
+    // --- WALLS STOP BOIDS ---
+    // A BUILT wall building occupies its grid cell. A boid entering that cell
+    // is pushed back out along the entry axis and loses ALL velocity in that
+    // axis - it can't slide along or through. A pathed boid whose route goes
+    // through the wall drops the path entirely: the way is blocked.
+    int wall_ci = -1;
+    {
+        int wcx = clamp(int(floor((pos.x - pc.world_min.x) / cell_size)), 0, dims.x - 1);
+        int wcz = clamp(int(floor((pos.z - pc.world_min.z) / cell_size)), 0, dims.z - 1);
+        uint wci = cell_index_2d(0, ivec3(wcx, 0, wcz), dims);
+        uint packed_w = cell_info.cells[wci].building;
+        if (cell_building_id(packed_w) == BUILDING_WALL
+            && cell_building_is_built(packed_w)
+            && int(cell_building_team(packed_w)) != my_team
+            && original_hex_id != new_hex_id) {
+            wall_ci = int(wci);
+        }
+    }
+    if (wall_ci >= 0) {
+        // Push back to the pre-move position and kill the offending velocity.
+        pos.xz = original_pos.xz;
+        vel.xz = vec2(0.0);
+        // Pathed boids whose claim hex no longer has a live path give up;
+        // anyone steered by an accel toward the wall simply re-tries next
+        // frame. Dropping the path lets the boid settle in its own hex.
+        assigned_hex = NO_PATH;
+        state &= ~uint(STATE_HAS_PATH);
+    }
+
+    // --- STARVATION: when the CPU flags the team out of resources, every
+    // boid bleeds ~2 HP/s. Folded into the final health write below; the CPU
+    // clears the flag as soon as income covers upkeep again.
+    uint starve_dmg = 0u;
+    if (econ_res.econ_res[my_team * 2 + 1] != 0u) {
+        my_team = 100;
+    }
+
     write_s.boids[id].pos = vec4(pos, float(my_team));
     write_s.boids[id].vel = vec4(vel, 0.0);
     write_s.boids[id].state = state;
@@ -697,7 +807,7 @@ void main() {
     // next frame's read side). The victim is the sole writer of its own
     // health - no cross-thread health writes anywhere.
     uint current_health = read_s.boids[id].health;
-    uint incoming = dmg_read.dmg[id];
+    uint incoming = dmg_read.dmg[id] + starve_dmg;
     if (incoming > 0u) {
         if (current_health <= incoming) {
             current_health = 0u;

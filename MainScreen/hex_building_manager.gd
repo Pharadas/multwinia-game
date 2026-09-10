@@ -20,26 +20,26 @@ class_name HexBuildingManager
 ## terrain height instead of a flat plane. Optional.
 @export var terrain_path: NodePath
 
-# Building ids - must match HexDetailView.BUILDING_* constants on the phone.
-const BUILDING_CASTLE := 0
-const BUILDING_TOWER := 1
+# Building ids - must match HexDetailView.BUILDING_NAMES keys on the phone.
+const BUILDING_BARRACK := 0
+const BUILDING_MINE := 1
 const BUILDING_WALL := 2
 
 ## Footprint of each building as a fraction of the PARENT hex circumradius.
 ## All buildings live inside their hex (whole-hex placement), so these stay
-## <= 1.0: a wall is a low fat disc filling most of the hex, the tower is a
-## slightly slimmer tall prism, the castle is the full hex.
+## <= 1.0: a wall is a low fat disc filling most of the hex, the barrack is
+## a mid-size squat house, the mine is a low wide pit.
 const BUILDING_HEX_FRACTION := {
 	BUILDING_WALL: 0.85,
-	BUILDING_TOWER: 0.6,
-	BUILDING_CASTLE: 0.98,
+	BUILDING_BARRACK: 0.62,
+	BUILDING_MINE: 0.7,
 }
 
 ## Height of each building, as a fraction of the world (parent) hex radius.
 const BUILDING_HEIGHT_FRAC := {
 	BUILDING_WALL: 0.15,
-	BUILDING_TOWER: 0.6,
-	BUILDING_CASTLE: 0.35,
+	BUILDING_BARRACK: 0.3,
+	BUILDING_MINE: 0.18,
 }
 
 ## Global size dial: multiplies footprint radius and height.
@@ -62,7 +62,7 @@ func _hex_world_radius() -> float:
 
 
 ## Place (or replace) the building that occupies hex (col, row) as a whole.
-## building_id: 0 = castle, 1 = tower, 2 = wall. The prism is centered on
+## building_id: 0 = barrack, 1 = mine, 2 = wall. The prism is centered on
 ## the hex's center point - not a sub-hex position.
 ## `built`: false = construction site - spawns as a small translucent ghost;
 ## call set_built() on the returned node once boids finish building it and
@@ -108,12 +108,12 @@ func _make_building_mesh(building_id: int, team: int, built: bool = true) -> Nod
 
 	var base_color: Color
 	match building_id:
-		BUILDING_CASTLE:
-			base_color = Color(0.95, 0.85, 0.2)  # gold
-		BUILDING_TOWER:
-			base_color = Color(0.6, 0.6, 0.7)    # steel grey
+		BUILDING_BARRACK:
+			base_color = Color(0.85, 0.45, 0.15) # rust orange
+		BUILDING_MINE:
+			base_color = Color(0.55, 0.3, 0.75)  # deep purple
 		_:
-			base_color = Color(0.55, 0.4, 0.3)   # brown
+			base_color = Color(0.55, 0.4, 0.3)   # brown (wall)
 
 	# Team tint blended into the building color so ownership is visible.
 	var mat := StandardMaterial3D.new()

@@ -18,12 +18,12 @@ signal building_placed(building_id: int)
 
 # ---- buildings ---------------------------------------------------------------
 ## id -> display name
-const BUILDING_NAMES := {0: "Castle", 1: "Tower", 2: "Wall"}
+const BUILDING_NAMES := {0: "Barrack", 1: "Mine", 2: "Wall"}
 ## id -> palette/dot color on the phone
 const BUILDING_COLORS := {
-	0: Color(0.95, 0.85, 0.2),   # castle - gold
-	1: Color(0.6, 0.6, 0.7),     # tower  - steel grey
-	2: Color(0.55, 0.4, 0.3),    # wall   - brown
+	0: Color(0.85, 0.45, 0.15),  # barrack - rust orange
+	1: Color(0.55, 0.3, 0.75),   # mine    - deep purple
+	2: Color(0.55, 0.4, 0.3),    # wall    - brown
 }
 ## id -> relative size of the icon dot drawn inside a sub-hex
 const BUILDING_SIZES := {0: 0.55, 1: 0.38, 2: 0.22}
@@ -225,24 +225,25 @@ func _draw_building_icon(pos: Vector2, hex_r: float, building_id: int, alpha: fl
 	var s: float = hex_r * float(BUILDING_SIZES.get(building_id, 0.4))
 
 	match building_id:
-		0:  # Castle - wide body + two corner towers + battlements
-			var body := Rect2(pos + Vector2(-s, -s * 0.7), Vector2(s * 2.0, s * 1.4))
-			draw_rect(body, color)
-			# crenellations
-			for i in range(3):
-				var notch := Rect2(pos + Vector2(-s + i * s * 0.8, -s * 1.1), Vector2(s * 0.45, s * 0.45))
-				draw_rect(notch, color)
-			draw_rect(body, Color(0, 0, 0, 0.5 * alpha), false, 2.0)
-		1:  # Tower - tall thin body + pointed roof
-			var body := Rect2(pos + Vector2(-s * 0.55, -s * 0.2), Vector2(s * 1.1, s * 1.7))
+		0:  # Barrack - house with gabled roof and a door
+			var body := Rect2(pos + Vector2(-s, -s * 0.5), Vector2(s * 2.0, s * 1.2))
 			draw_rect(body, color)
 			var roof := PackedVector2Array([
-				pos + Vector2(-s * 0.75, -s * 0.2),
-				pos + Vector2(s * 0.75, -s * 0.2),
-				pos + Vector2(0.0, -s * 1.2),
+				pos + Vector2(-s * 1.2, -s * 0.5),
+				pos + Vector2(s * 1.2, -s * 0.5),
+				pos + Vector2(0.0, -s * 1.4),
 			])
-			draw_polygon(roof, PackedColorArray([color]))
+			draw_polygon(roof, PackedColorArray([color.darkened(0.35)]))
+			var door := Rect2(pos + Vector2(-s * 0.25, s * 0.1), Vector2(s * 0.5, s * 0.6))
+			draw_rect(door, color.darkened(0.5))
 			draw_rect(body, Color(0, 0, 0, 0.5 * alpha), false, 2.0)
+		1:  # Mine - dark pit with sparkling ore chunks
+			var pit := Rect2(pos + Vector2(-s, -s * 0.6), Vector2(s * 2.0, s * 1.2))
+			draw_rect(pit, color.darkened(0.45))
+			for i in range(4):
+				var gem := Vector2(pos.x + (float(i % 2) - 0.5) * s, pos.y + (float(i / 2) - 0.5) * s * 0.6)
+				draw_circle(gem, s * 0.18, color.lerp(Color.WHITE, 0.4))
+			draw_rect(pit, Color(0, 0, 0, 0.5 * alpha), false, 2.0)
 		2:  # Wall - horizontal slab
 			var body := Rect2(pos + Vector2(-s, -s * 0.45), Vector2(s * 2.0, s * 0.9))
 			draw_rect(body, color)

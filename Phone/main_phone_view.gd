@@ -125,6 +125,9 @@ var _fraction_label: Label = null
 var _connections: Dictionary = {} # key -> {"from": Vector2i, "to": Vector2i, "nodes": Array[Node], "path": Array[Vector2i]}
 var _connection_nodes: Array[Node] = [] # every Line2D/marker drawn so far, for cleanup on repopulate
 
+# --- Building placement state (whole-hex, via the always-visible palette) ---
+var _build_preview_circle: Node2D = null
+
 # --- Hex detail view state ---
 var _detail_view: HexDetailView = null
 ## Buildings placed per parent hex: Vector2i(col,row) -> building_id
@@ -192,6 +195,30 @@ func _setup_ui() -> void:
 	draw_btn.toggled.connect(_on_draw_mode_toggled)
 	canvas.add_child(draw_btn)
 
+	## Bottom bar: the three building chips, always visible. Press a chip to
+	## pick the building up, drag onto the grid, release on a hex to place it.
+	var palette := PanelContainer.new()
+	palette.name = "BuildPalette"
+	palette.anchor_left = 0.0
+	palette.anchor_right = 1.0
+	palette.anchor_top = 1.0
+	palette.anchor_bottom = 1.0
+	palette.offset_top = -96.0
+	palette.offset_bottom = -12.0
+	var pal_row := HBoxContainer.new()
+	pal_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	pal_row.add_theme_constant_override("separation", 24)
+	palette.add_child(pal_row)
+	for id in HexDetailView.BUILDING_NAMES:
+		var chip := Button.new()
+		chip.text = HexDetailView.BUILDING_NAMES[id]
+		chip.custom_minimum_size = Vector2(130, 64)
+		chip.add_theme_color_override("font_color", HexDetailView.BUILDING_COLORS[id])
+		# button_down fires on press so the building is in hand while dragging.
+		chip.button_down.connect(_build_press.bind(id))
+		chip.mouse_default_cursor_shape = Control.CURSOR_DRAG
+		pal_row.add_child(chip)
+	canvas.add_child(palette)
 
 func _on_reset_roads_pressed() -> void:
 	_clear_connections()
@@ -209,6 +236,89 @@ func _on_draw_mode_toggled(pressed: bool) -> void:
 		_draw_line.default_color = Color(1.0, 0.3, 0.3, 0.6)
 		_drawn_paths.append(_draw_line)
 		_draw_line = null
+
+
+
+
+## Building placement: the bottom palette is always visible. Pressing a chip
+## puts that building "in hand"; dragging over the grid shows a hex highlight,
+## releasing on a hex places it there (whole-hex, one per hex, re-drop
+## replaces). Releasing anywhere else cancels.
+var _build_dragging_id: int = -1
+
+
+## Press on a palette chip - begin carrying that building. `screen_pos` is
+## only used for the first preview; defaults to the current mouse position
+## (palette chips bind only the building id).
+func _build_press(building_id: int, screen_pos: Vector2 = Vector2.ZERO) -> void:
+	if not tile_map_layer:
+		return
+	if screen_pos == Vector2.ZERO:
+		screen_pos = get_viewport().get_mouse_position()
+	_build_dragging_id = building_id
+	_draw_build_preview(tile_map_layer.to_local(screen_pos))
+
+
+## Finger/cursor moved while carrying a building - refresh the hex highlight.
+func _build_drag(screen_pos: Vector2) -> void:
+	if _build_dragging_id < 0 or not tile_map_layer:
+		return
+	_draw_build_preview(tile_map_layer.to_local(screen_pos))
+
+
+## Release - place on the hex under the pointer, if any. Otherwise cancel.
+func _build_release(screen_pos: Vector2) -> void:
+	if _build_dragging_id < 0:
+		return
+	var id := _build_dragging_id
+	_build_dragging_id = -1
+	_clear_build_preview()
+	if not tile_map_layer:
+		return
+	var cell := tile_map_layer.local_to_map(tile_map_layer.to_local(screen_pos))
+	if _cell_in_bounds(cell):
+		_place_building(cell, id)
+
+
+func _place_building(cell: Vector2i, building_id: int) -> void:
+	_hex_buildings[cell] = building_id
+	_update_building_markers()
+	var socket := _get_socket_node()
+	if socket and socket.has_method("send_building_placed"):
+		socket.send_building_placed(cell.x, cell.y, building_id, team_number)
+
+
+
+
+func _draw_build_preview(local_pos: Vector2) -> void:
+	_clear_build_preview()
+	if not tile_map_layer:
+		return
+	var cell := tile_map_layer.local_to_map(local_pos)
+	if not _cell_in_bounds(cell):
+		return
+	var marker := Node2D.new()
+	marker.position = tile_map_layer.map_to_local(cell)
+	var tile_sz := Vector2(tile_map_layer.tile_set.tile_size)
+	marker.draw.connect(func():
+		# Build the full 6-point polygon FIRST, then draw once - drawing
+		# inside the append loop fed canvas_item_add_polygon a 1-point array
+		# ("Condition pointcount < 3" error).
+		var pts := PackedVector2Array()
+		var r := tile_sz.x * 0.55
+		for i in range(6):
+			var a := deg_to_rad(60.0 * float(i))
+			pts.append(Vector2(cos(a), sin(a)) * r)
+		marker.draw_colored_polygon(pts, Color(1.0, 1.0, 1.0, 0.6))
+	, CONNECT_REFERENCE_COUNTED)
+	tile_map_layer.add_child(marker)
+	_build_preview_circle = marker
+
+
+func _clear_build_preview() -> void:
+	if _build_preview_circle:
+		_build_preview_circle.queue_free()
+		_build_preview_circle = null
 
 
 func _ensure_draw_line() -> void:
@@ -747,6 +857,8 @@ func _close_hex_detail() -> void:
 	if _detail_view and is_instance_valid(_detail_view):
 		_detail_view.queue_free()
 	_detail_view = null
+	_build_dragging_id = -1
+	_clear_build_preview()
 
 # --- Input handling ---------------------------------------------------
 # Press (mouse or a first finger) on a cell to start a drag, drag anywhere,
@@ -778,10 +890,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			else:
 				_start_drag()
 		else:
-			if _draw_mode:
+			if _build_dragging_id >= 0:
+				# Carrying a building from the palette chip - drop it here.
+				_build_release(event.position)
+			elif _draw_mode:
 				if _draw_points.size() >= 2:
 					_send_simplified_path()
-				_draw_points.clear()
+					_draw_points.clear()
 			else:
 				_end_drag()
 			_touch_active = false
@@ -797,6 +912,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_draw_points.append(local_pos)
 				_ensure_draw_line()
 				_draw_line.points = _draw_points
+		elif _build_dragging_id >= 0:
+			_build_drag(event.position)
 		return
 
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
@@ -810,10 +927,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			else:
 				_start_drag()
 		else:
-			if _draw_mode:
+			if _build_dragging_id >= 0:
+				# Carrying a building from the palette chip - drop it here.
+				_build_release(get_viewport().get_mouse_position())
+			elif _draw_mode:
 				if _draw_points.size() >= 2:
 					_send_simplified_path()
-				_draw_points.clear()
+					_draw_points.clear()
 			else:
 				_end_drag()
 
@@ -831,6 +951,9 @@ func _process(_delta: float) -> void:
 			_draw_points.append(local_pos)
 			_ensure_draw_line()
 			_draw_line.points = _draw_points
+	elif _build_dragging_id >= 0:
+		# Carrying a building with the mouse - keep the hex highlight under it.
+		_draw_build_preview(tile_map_layer.to_local(get_viewport().get_mouse_position()))
 
 	# Continuously broadcast whatever cell the pointer (mouse or touch) is
 	# over right now, so the receiver always has an up-to-date hover

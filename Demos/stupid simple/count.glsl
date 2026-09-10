@@ -14,6 +14,12 @@ struct BoidState {
 
 layout(set=0, binding=0, std430) buffer StateBuf { BoidState boids[]; } state;
 layout(set=0, binding=1, std430) buffer CellCount { uint counts[]; } cell_count;
+// Per-team economy stats the CPU reads once per second (the econ tick):
+//   [t*2]   = alive boid count        (CPU clears before dispatch)
+//   [t*2+1] = dead boid id + 1 for the revival pool (0 = none this pass;
+//             atomicMax keeps the LARGEST, so CPU revives one boid per
+//             barrack-tick by taking the highest free boid id)
+layout(set=0, binding=2, std430) buffer EconStatsBuf { uint stats[]; } econ_stats;
 layout(push_constant) uniform PC {
     vec4 params; vec4 world_min; ivec4 grid_dims;
     vec4 hex_params; ivec4 hex_grid;
@@ -34,9 +40,17 @@ uint cell_index(int team, ivec3 cell, ivec3 dims) {
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uint(pc.params.y)) return;
-    if (state.boids[id].health == 0u) return;
     int team = int(state.boids[id].team) % 4;
-    ivec3 cell = get_cell(state.boids[id].pos.xyz, pc.world_min.xyz, pc.params.z);
-    uint idx = cell_index(team, cell, pc.grid_dims.xyz);
-    atomicAdd(cell_count.counts[idx], 1);
+
+    if (state.boids[id].health != 0u) {
+        // ALIVE: count it into its team's spatial grid (existing behavior).
+        ivec3 cell = get_cell(state.boids[id].pos.xyz, pc.world_min.xyz, pc.params.z);
+        uint idx = cell_index(team, cell, pc.grid_dims.xyz);
+        atomicAdd(cell_count.counts[idx], 1);
+        atomicAdd(econ_stats.stats[team * 2], 1u);
+    } else {
+        // DEAD: record the largest dead id (+1 so 0 can mean "none") - the
+        // CPU's barrack revival picks these up one at a time.
+        atomicMax(econ_stats.stats[team * 2 + 1], id + 1u);
+    }
 }

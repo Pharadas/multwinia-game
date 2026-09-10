@@ -39,6 +39,15 @@ var sorted_indices_rid: RID
 var mm_buffer_rid: RID
 var cell_info_rid: RID
 var global_paths_rid: RID
+# Economy: 8 u32s - [t*2+1] is team t's starve flag (CPU-written, sim-read).
+# [t*2] is unused on GPU; resource amounts live CPU-side in _team_resources.
+var econ_res_rid: RID
+# Per-frame count-pass output, 8 u32s: [t*2]=alive count, [t*2+1]=largest
+# dead boid id + 1 (revival pool). Cleared every frame, read every second.
+var econ_stats_rid: RID
+# One u32 per xz grid cell: 1 = ground collapsed (mine depleted). Boids on
+# it fall and die (sim.glsl). CPU-written once at collapse time.
+var collapse_rid: RID
 # Ping-ponged per-boid damage accumulators (uint per boid). Attackers
 # atomicAdd onto the write side; victims consume last frame's read side.
 var dmg_buffers: Array[RID] = []
@@ -66,7 +75,24 @@ var _elapsed_seconds: float = 0.0
 
 ## How long a freshly-set path stays claimable, in seconds. Claimant boids
 ## finish their path regardless of expiry (see sim.glsl soft-expiry comment).
-@export var path_lifetime := 30.0
+## Short-lived by design: paths fade fast, new claims pick fresh ones.
+@export var path_lifetime := 10.0
+
+# ---- economy -------------------------------------------------------------------
+const MINE_INCOME := 5.0          # resources per second per owned mine
+const UPKEEP_PER_SEC := 0.2       # each dot costs 1 resource per 5 seconds
+const BARRACK_REVIVE_COST := 1.0  # resources to regenerate one dead dot
+const MINE_LIFETIME := 60.0       # seconds a mine generates before collapsing
+const STARTING_RESOURCES := 2000.0
+
+## CPU-side resource pool per team.
+var _team_resources: Array[float] = []
+## Seconds until each mine collapses: Vector2i(cell) -> float
+var _mine_timers: Dictionary = {}
+var _econ_timer := 0.0
+## Set by main_screen.gd (or a demo harness) to learn when a mine's ground
+## tile is destroyed, so meshes/terrain can react.
+signal mine_collapsed(cell: Vector2i, world_pos: Vector2)
 
 
 func _ready() -> void:
@@ -122,6 +148,7 @@ func _initial_dispatch() -> void:
 	# Run the full pipeline once at startup so mm_buffer has real positions
 	# before Godot renders the first frame (avoids center flash from garbage data).
 	rd.buffer_clear(cell_count_rid, 0, table_size * 4)
+	rd.buffer_clear(econ_stats_rid, 0, 8 * 4)
 	rd.buffer_clear(dmg_buffers[0], 0, instance_count * 4)
 	rd.buffer_clear(dmg_buffers[1], 0, instance_count * 4)
 	var push_bytes := _build_push_constants(0.0)
@@ -356,6 +383,15 @@ func _create_buffers() -> void:
 	global_paths_bytes.resize(num_cells * 4 * 1368)
 	global_paths_rid = rd.storage_buffer_create(global_paths_bytes.size(), global_paths_bytes)
 
+	# Economy buffers: starve flags (CPU->GPU), per-frame alive/dead stats
+	# (GPU->CPU), collapse flags (CPU->GPU). All zero-initialized.
+	econ_res_rid = rd.storage_buffer_create(8 * 4)
+	econ_stats_rid = rd.storage_buffer_create(8 * 4)
+	collapse_rid = rd.storage_buffer_create(table_size * 4)
+
+	for t in range(4):
+		_team_resources.append(STARTING_RESOURCES)
+
 	mm_buffer_rid = RenderingServer.multimesh_get_buffer_rd_rid(multimesh.get_rid())
 
 
@@ -371,9 +407,9 @@ func _build_uniform_sets() -> void:
 	for parity in range(2):
 		var other = 1 - parity
 
-		# count.glsl: binding0=state(read), binding1=cell_count
+		# count.glsl: binding0=state(read), binding1=cell_count, binding2=econ_stats
 		uniform_sets_count.append(rd.uniform_set_create(
-			[_make_uniform(0, state_buffers[parity]), _make_uniform(1, cell_count_rid)],
+			[_make_uniform(0, state_buffers[parity]), _make_uniform(1, cell_count_rid), _make_uniform(2, econ_stats_rid)],
 			shader_rids["count"], 0
 		))
 
@@ -396,6 +432,8 @@ func _build_uniform_sets() -> void:
 				_make_uniform(6, global_paths_rid),
 				_make_uniform(7, dmg_buffers[other]),   # write side: becomes next frame's read
 				_make_uniform(8, dmg_buffers[parity]),  # read side: last frame's totals
+				_make_uniform(9, econ_res_rid),         # starve flags (CPU-managed)
+				_make_uniform(10, collapse_rid),        # collapsed-tile flags
 			],
 			shader_rids["sim"], 0
 		))
@@ -442,10 +480,15 @@ func _build_push_constants(delta: float) -> PackedByteArray:
 
 func _process(delta: float) -> void:
 	_elapsed_seconds += delta
+	_econ_timer += delta
+	if _econ_timer >= 1.0:
+		_econ_timer -= 1.0
+		_economy_tick()
 	var read_i = frame_parity
 	var write_i = 1 - frame_parity
 
 	rd.buffer_clear(cell_count_rid, 0, table_size * 4)
+	rd.buffer_clear(econ_stats_rid, 0, 8 * 4)
 	# Zero this frame's damage write-accumulator before attackers atomicAdd
 	# onto it. The read side holds last frame's totals - consumed, not cleared.
 	rd.buffer_clear(dmg_buffers[write_i], 0, instance_count * 4)
@@ -500,6 +543,9 @@ func _exit_tree() -> void:
 	rd.free_rid(cell_offset_rid)
 	rd.free_rid(write_cursor_rid)
 	rd.free_rid(sorted_indices_rid)
+	rd.free_rid(econ_res_rid)
+	rd.free_rid(econ_stats_rid)
+	rd.free_rid(collapse_rid)
 	for rid in dmg_buffers:
 		rd.free_rid(rid)
 	for rid in uniform_sets_count: rd.free_rid(rid)
@@ -598,15 +644,147 @@ func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: i
 		rd.buffer_update(cell_info_rid, byte_off, 4, buf)
 
 	# Remember where this building lives so get_building_build_state()
-	# can find it again when a boid finishes constructing it.
+	# can find it again when a boid finishes constructing it. Built mines
+	# also join the economy: they pay income and count down to collapse.
 	if building_id >= 0:
 		_building_sites[Vector2i(cx, cz)] = {"packed": packed, "world": world_pos}
+		if building_id == 1 and built:
+			_active_mines[Vector2i(cx, cz)] = {"team": team, "world": world_pos, "life": MINE_LIFETIME}
+		elif building_id == 1 and not built:
+			_active_mines.erase(Vector2i(cx, cz))
 	else:
 		_building_sites.erase(Vector2i(cx, cz))
+		_active_mines.erase(Vector2i(cx, cz))
 
 ## Per-cell building bookkeeping for the build flow:
 ## Vector2i(cell_x, cell_z) -> {"packed": int, "world": Vector2}
 var _building_sites: Dictionary = {}
+
+## Every cell containing a BUILT mine, for the economy tick + collapse:
+## Vector2i(cell_x, cell_z) -> {"team": int, "world": Vector2}
+var _active_mines: Dictionary = {}
+
+## Runs once per simulated second: mines pay out, upkeep drains, starve
+## flags update, and each barrack revives one dead dot if the team can pay.
+func _economy_tick() -> void:
+	var income := [0.0, 0.0, 0.0, 0.0]
+	var upkeep := [0.0, 0.0, 0.0, 0.0]
+	var mines_to_collapse: Array = []
+
+	# --- mine income + lifetime countdown ---
+	for cell in _active_mines.keys():
+		var mine: Dictionary = _active_mines[cell]
+		var t: int = clampi(int(mine.team), 0, 3)
+		income[t] += MINE_INCOME
+		var life: float = mine.get("life", MINE_LIFETIME) - 1.0
+		mine.life = life
+		if life <= 0.0:
+			mines_to_collapse.append(cell)
+
+	# --- upkeep: every LIVING dot costs 1 resource / 5 seconds ---
+	var stats := rd.buffer_get_data(econ_stats_rid, 0, 8 * 4)
+	if stats.size() >= 32:
+		for t in range(4):
+			upkeep[t] = float(stats.decode_u32(t * 8)) * UPKEEP_PER_SEC
+
+	# --- apply, set starve flags, revive via barracks ---
+	var flags := PackedByteArray()
+	flags.resize(8 * 4)
+	for t in range(4):
+		_team_resources[t] += income[t] - upkeep[t]
+		if _team_resources[t] < 0.0:
+			_team_resources[t] = 0.0
+			flags.encode_u32(t * 8 + 4, 1)  # starve: sim bleeds boid health
+
+	# Revive: one dead dot per second per team, costs 1 resource. The count
+	# pass leaves the largest dead boid id + 1 in stats[t*2+1].
+	var barracks := [0, 0, 0, 0]
+	for cell in _building_sites.keys():
+		var packed: int = _building_sites[cell].packed
+		if (packed & 0xFF) == 0 and (packed & BUILDING_BUILT_FLAG) != 0:
+			barracks[clampi((packed >> 8) & 0xFF, 0, 3)] += 1
+	for t in range(4):
+		var dead_id := stats.decode_u32(t * 8 + 4) if stats.size() >= 32 else 0
+		if barracks[t] > 0 and dead_id != 0 and _team_resources[t] >= BARRACK_REVIVE_COST:
+			_team_resources[t] -= BARRACK_REVIVE_COST
+			_revive_boid(t, dead_id - 1)
+
+	rd.buffer_update(econ_res_rid, 0, flags.size(), flags)
+
+	# --- collapse depleted mines ---
+	for cell in mines_to_collapse:
+		_collapse_mine(cell)
+
+## Respawns a dead boid at its team's first barrack.
+func _revive_boid(team: int, boid_id: int) -> void:
+	if boid_id < 0 or boid_id >= instance_count:
+		return
+	var barrack_pos := Vector2.ZERO
+	var found := false
+	for cell in _building_sites.keys():
+		var packed: int = _building_sites[cell].packed
+		if (packed & 0xFF) == 0 and (packed & BUILDING_BUILT_FLAG) != 0 \
+				and ((packed >> 8) & 0xFF) == team:
+			barrack_pos = _building_sites[cell].world
+			found = true
+			break
+	if not found:
+		return
+	var floats_per_boid := 16
+	var row := PackedFloat32Array()
+	row.resize(floats_per_boid)
+	row[0] = barrack_pos.x + randf_range(-2.0, 2.0)
+	row[1] = WORLD_MIN.y + 2.0
+	row[2] = barrack_pos.y + randf_range(-2.0, 2.0)
+	row[3] = 0.0
+	# vel = 0
+	row[4] = 0.0; row[5] = 0.0; row[6] = 0.0; row[7] = 0.0
+	row[8] = 0.0  # state
+	var np := PackedByteArray()
+	np.resize(4)
+	np.encode_u32(0, 0xFFFFFFFF)
+	row[9] = np.decode_float(0)
+	row[10] = 0.0
+	var tb := PackedByteArray()
+	tb.resize(4)
+	tb.encode_u32(0, team)
+	row[11] = tb.decode_float(0)
+	var hp := PackedByteArray()
+	hp.resize(4)
+	hp.encode_u32(0, 1000)
+	row[12] = hp.decode_float(0)
+	var hh := PackedByteArray()
+	hh.resize(4)
+	hh.encode_s32(0, 0)
+	row[13] = hh.decode_float(0)
+	var buf := row.to_byte_array()
+	var byte_offset := boid_id * floats_per_boid * 4
+	for sbuf in state_buffers:
+		rd.buffer_update(sbuf, byte_offset, buf.size(), buf)
+
+## Depletes a mine: clears the building from cell_info, flags the tile
+## collapsed (boids on it fall and die in sim.glsl), frees the site record.
+func _collapse_mine(cell: Vector2i) -> void:
+	if not _active_mines.has(cell):
+		return
+	var mine: Dictionary = _active_mines[cell]
+	_active_mines.erase(cell)
+	# 1. Remove the building from the GPU cell_info (all 4 team slices).
+	var xz := grid_dims.x * grid_dims.z
+	var buf := PackedByteArray()
+	buf.resize(4)
+	buf.encode_u32(0, 0xFF)  # "no building"
+	for t in range(4):
+		var byte_off := (t * xz + cell.y * grid_dims.x + cell.x) * 8 + 4
+		rd.buffer_update(cell_info_rid, byte_off, 4, buf)
+	# 2. Flag the tile collapsed - sim drops every boid standing on it.
+	var cbuf := PackedByteArray()
+	cbuf.resize(4)
+	cbuf.encode_u32(0, 1)
+	rd.buffer_update(collapse_rid, (cell.y * grid_dims.x + cell.x) * 4, 4, cbuf)
+	# 3. Forget the site so barracks/build scans stop seeing it.
+	_building_sites.erase(cell)
+	mine_collapsed.emit(cell, mine.world)
 
 ## Reads the BUILT flag back from the GPU for the building in grid cell
 ## (cx, cz). Returns true when a boid has finished constructing it, false
