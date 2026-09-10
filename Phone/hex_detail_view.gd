@@ -5,14 +5,16 @@ class_name HexDetailView
 ## smaller hexagons tiled so their overall silhouette is also a hexagon.
 ## Set up via setup() BEFORE adding to the scene tree so _ready() has all the data.
 ##
-## BUILDINGS: drag one of the palette buttons (bottom bar) onto a sub-hex
-## to place it. Placements are local until `building_placed` is relayed to
-## the main screen by whoever listens to it.
+## BUILDINGS: drag one of the palette buttons (bottom bar) onto the honeycomb
+## to place it. Buildings occupy WHOLE hexes - there are no sub-hex positions.
+## Dropping anywhere inside the grid claims the entire hex for that building
+## (one building per hex; dropping again replaces it). Placements are local
+## until `building_placed` is relayed to the main screen by whoever listens.
 
 signal back_pressed
-## Emitted when a building is dropped on a sub-hex: (sub_q, sub_r, building_id).
+## Emitted when a building is dropped on this hex.
 ## building_id: 0 = castle, 1 = tower, 2 = wall.
-signal building_placed(sub_q: int, sub_r: int, building_id: int)
+signal building_placed(building_id: int)
 
 # ---- buildings ---------------------------------------------------------------
 ## id -> display name
@@ -54,8 +56,9 @@ var _unit_positions: Dictionary = {}   # Vector2i -> Vector2
 var _last_center: Vector2 = Vector2.ZERO
 var _last_hex_r: float = 1.0
 
-## Placed buildings: Vector2i(sub_q, sub_r) -> building_id
-var _buildings: Dictionary = {}
+## The building occupying this whole hex (building_id), or -1 for none.
+## Whole-hex granularity: one building per hex, no sub-hex coordinates.
+var _building: int = -1
 
 # Drag state: currently held building id, and where the finger/mouse is.
 var _dragging_building: int = -1
@@ -71,10 +74,20 @@ func setup(col: int, row: int, color: Color, is_wall: bool = false) -> void:
 	hex_is_wall = is_wall
 
 
-## Replace the local building map (e.g. when re-opening a hex that already
-## has buildings synced from the main screen).
+## Set the whole-hex building from synced state (e.g. when re-opening a hex
+## that already has a building synced from the main screen).
+## Accepts the legacy {Vector2i -> id} map too, using its first entry.
+func set_building(building_id: int) -> void:
+	_building = building_id
+	queue_redraw()
+
+
 func set_buildings(buildings: Dictionary) -> void:
-	_buildings = buildings.duplicate()
+	if buildings.is_empty():
+		_building = -1
+	else:
+		var first = buildings.values()[0]
+		_building = int(first) if first is int else -1
 	queue_redraw()
 
 
@@ -196,9 +209,9 @@ func _draw() -> void:
 		for i in range(6):
 			draw_line(poly[i], poly[(i + 1) % 6], border_color, border_width)
 
-		# Draw the building placed on this sub-hex (a stylized icon).
-		if _buildings.has(cell):
-			_draw_building_icon(pos, hex_r, _buildings[cell])
+		# Draw the building occupying this whole hex (a stylized icon at center).
+		if _building >= 0 and cell == Vector2i.ZERO:
+			_draw_building_icon(pos, hex_r, _building)
 
 	# Dragged building follows the finger above everything.
 	if _dragging_building >= 0:
@@ -334,9 +347,10 @@ func _on_palette_chip_down(building_id: int) -> void:
 	queue_redraw()
 
 
-## Remove the building on a sub-hex (tap a placed building without dragging).
-func remove_building_at(cell: Vector2i) -> void:
-	if _buildings.erase(cell):
+## Remove the building on this hex.
+func remove_building() -> void:
+	if _building >= 0:
+		_building = -1
 		queue_redraw()
 
 
@@ -344,17 +358,17 @@ func remove_building_at(cell: Vector2i) -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if _dragging_building < 0:
-		# Tap on an occupied sub-hex removes its building (nice-to-have undo).
+		# Tap on the hex (it has a building) removes it (nice-to-have undo).
 		if event is InputEventScreenTouch and not event.pressed:
 			var cell := _cell_at(event.position)
-			if _buildings.has(cell):
-				_buildings.erase(cell)
+			if _cells.has(cell) and _building >= 0:
+				_building = -1
 				queue_redraw()
 		elif event is InputEventMouseButton and not event.pressed \
 				and event.button_index == MOUSE_BUTTON_LEFT:
 			var cell := _cell_at(event.position)
-			if _buildings.has(cell):
-				_buildings.erase(cell)
+			if _cells.has(cell) and _building >= 0:
+				_building = -1
 				queue_redraw()
 		return
 
@@ -379,7 +393,8 @@ func _drop_building(cell: Vector2i) -> void:
 	var id := _dragging_building
 	_dragging_building = -1
 	_drag_hot_cell = Vector2i(9999, 9999)
+	# Whole-hex placement: any drop inside the grid claims the ENTIRE hex.
 	if _cells.has(cell):
-		_buildings[cell] = id
-		building_placed.emit(cell.x, cell.y, id)
+		_building = id
+		building_placed.emit(id)
 	queue_redraw()

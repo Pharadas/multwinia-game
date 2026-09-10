@@ -9,6 +9,7 @@ struct BoidState {
     uint assigned_path_slot;
     uint team;
     uint health;
+    int home_hex;
 };
 
 layout(set=0, binding=0, std430) buffer StateBuf { BoidState boids[]; } state;

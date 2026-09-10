@@ -9,6 +9,7 @@ struct BoidState {
     uint assigned_path_slot;
     uint team;
     uint health;
+    int home_hex;
 };
 
 struct InstanceData {
@@ -43,6 +44,10 @@ void main() {
     vec3 right = normalize(cross(up_hint, fwd));
     vec3 up = cross(fwd, right);
 
+    // Godot's MultiMesh transform buffer is 12 floats in Transform3D
+    // constructor order: basis row 0, origin.x, basis row 1, origin.y,
+    // basis row 2, origin.z. Each vec4 is one 4-float group (std430 vec4
+    // stride = 16B, no padding), so origin lands in each vec4's .w.
     mm_buffer.instances[id].row1 = vec4(right.x, up.x, fwd.x, pos.x);
     mm_buffer.instances[id].row2 = vec4(right.y, up.y, fwd.y, pos.y);
     mm_buffer.instances[id].row3 = vec4(right.z, up.z, fwd.z, pos.z);

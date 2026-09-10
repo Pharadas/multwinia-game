@@ -239,13 +239,15 @@ func send_clear_roads(team_number: int) -> void:
 
 ## Called by HexGrid2D when a free-drawn path is simplified to 16 points.
 ## Sends the tilemap-local positions plus reference cell mappings to the main screen.
-func send_drawn_path(points: Array, team_number: int, ref_cells: Array = [], ref_locals: Array = []) -> void:
+## `fraction` (0..1) is what percentage of boids should follow this path
+## (1.0 = everyone).
+func send_drawn_path(points: Array, team_number: int, ref_cells: Array = [], ref_locals: Array = [], fraction: float = 1.0) -> void:
 	if _peer and _was_connected:
-		_peer.put_var({"type": "drawn_path", "points": points, "team": team_number, "ref_cells": ref_cells, "ref_locals": ref_locals})
+		_peer.put_var({"type": "drawn_path", "points": points, "team": team_number, "ref_cells": ref_cells, "ref_locals": ref_locals, "fraction": fraction})
 
-## Called by HexDetailView when a building is dropped on a sub-hex. Sub-hex
-## coordinates are axial (q, r) within the parent hex's own honeycomb; the
-## main screen places the 3D mesh inside that hex accordingly.
-func send_building_placed(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team_number: int) -> void:
+## Called by HexDetailView when a building is dropped on the open hex.
+## Whole-hex granularity: the main screen places the 3D mesh centered on
+## that hex - there are no sub-hex coordinates anymore.
+func send_building_placed(col: int, row: int, building_id: int, team_number: int) -> void:
 	if _peer and _was_connected:
-		_peer.put_var({"type": "building_placed", "col": col, "row": row, "sub_q": sub_q, "sub_r": sub_r, "building": building_id, "team": team_number})
+		_peer.put_var({"type": "building_placed", "col": col, "row": row, "building": building_id, "team": team_number})

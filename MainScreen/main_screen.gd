@@ -126,19 +126,24 @@ func _on_player_joined(team: int) -> void:
 # 	_spawn_team_army(team)
 
 
-func _on_drawn_path_received(points: Array, team: int) -> void:
+func _on_drawn_path_received(points: Array, team: int, fraction: float = 1.0) -> void:
 	var ss = $StupidSimple.get_child(0)
 	if points.is_empty():
 		print("no points to draw path!")
 		return
 	ss.set_path(points, 0, 0, team)
-	print("Global path set: %d points for team %d" % [points.size(), team])
+	# Apply the follower percentage to every hex the path starts from - boids
+	# claim paths at the path's start hex, so that's where the gate lives.
+	var start_hex: Vector2i = ss.world_to_hex(Vector2(points[0].x, points[0].y))
+	ss.set_path_fraction(start_hex.x, start_hex.y, team, fraction)
+	print("Global path set: %d points for team %d (fraction %.2f)" % [points.size(), team, fraction])
 
 
-## A phone dropped a building on a sub-hex of hex (col, row). Spawn the 3D
-## mesh via HexBuildingManager and update the GPU cell_info buffer, creating
-## the manager on first use.
-func _on_building_placed_remote(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team: int) -> void:
+## A phone dropped a building on hex (col, row) as a WHOLE. It starts as a
+## construction site: a ghost mesh + unbuilt flag in the GPU cell_info buffer.
+## Boids from the owning team march there and flip the flag (sim.glsl's
+## construction block); a poll timer then swaps in the full-size mesh.
+func _on_building_placed_remote(col: int, row: int, building_id: int, team: int) -> void:
 	var mgr := get_node_or_null("HexBuildingManager")
 	if not mgr:
 		mgr = HexBuildingManager.new()
@@ -149,25 +154,69 @@ func _on_building_placed_remote(col: int, row: int, sub_q: int, sub_r: int, buil
 		# "." would resolve to the manager itself, which broke placement.
 		mgr.terrain_path = NodePath("..")
 		add_child(mgr)
-	var node: Node3D = mgr.place_building(col, row, sub_q, sub_r, building_id, team)
+	var node: Node3D = mgr.place_building(col, row, building_id, team, false)
 
-	# Push the building into the GPU cell_info buffer (sim.glsl reads it).
-	_push_building_to_cell_info(col, row, sub_q, sub_r, building_id, team, node)
+	# Push the UNBUILT building into the GPU cell_info buffer (sim.glsl reads
+	# it and sends builders). The building occupies its hex center.
+	_push_building_to_cell_info(col, row, building_id, team, node, false)
+	# Track the site so the poll can complete it later.
+	_pending_builds.append({"node": node, "building_id": building_id, "team": team})
+	if _build_poll_timer == null:
+		_build_poll_timer = Timer.new()
+		_build_poll_timer.wait_time = 0.5
+		_build_poll_timer.timeout.connect(_poll_building_builds)
+		add_child(_build_poll_timer)
+	if not _build_poll_timer.is_stopped() or _pending_builds.size() == 1:
+		_build_poll_timer.start()
+
+var _pending_builds: Array = []
+var _build_poll_timer: Timer = null
+
+## Every 0.5s, check the GPU built-flag for each pending construction site;
+## when a boid has flipped it, swap the ghost mesh for the real building.
+func _poll_building_builds() -> void:
+	var ss_node := get_node_or_null("StupidSimple")
+	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	var mgr := get_node_or_null("HexBuildingManager")
+	var i := _pending_builds.size() - 1
+	while i >= 0:
+		var site: Dictionary = _pending_builds[i]
+		var node: Node3D = site.node
+		if not is_instance_valid(node):
+			_pending_builds.remove_at(i)
+			i -= 1
+			continue
+		if ss and ss.has_method("is_building_built"):
+			# Resolve the site's world position back to its grid cell.
+			var wp := node.global_position
+			var cx := int(floor((wp.x - ss.WORLD_MIN.x) / ss.CELL_SIZE))
+			var cz := int(floor((wp.z - ss.WORLD_MIN.z) / ss.CELL_SIZE))
+			if ss.is_building_built(cx, cz):
+				if mgr and mgr.has_method("set_built"):
+					mgr.set_built(node)
+				# Re-mark the buffer built (boid already did it, this keeps
+				# CPU/GPU in sync if the buffer was re-uploaded meanwhile).
+				if ss.has_method("set_cell_building"):
+					ss.set_cell_building(Vector2(wp.x, wp.z), site.building_id, site.team, 0, 0, true)
+				_pending_builds.remove_at(i)
+		i -= 1
+	if _pending_builds.is_empty() and _build_poll_timer:
+		_build_poll_timer.stop()
 
 
-## Computes the building's world position the same way HexBuildingManager
-## does and writes packed info into the cell covering that position.
-func _push_building_to_cell_info(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team: int, node: Node3D) -> void:
+## Writes packed info into the cell covering the hex's center. Buildings are
+## whole-hex now, so the world position is the hex center itself.
+func _push_building_to_cell_info(col: int, row: int, building_id: int, team: int, node: Node3D, built: bool = true) -> void:
 	var ss_node := get_node_or_null("StupidSimple")
 	if not ss_node or ss_node.get_child_count() == 0:
 		return
 	var ss = ss_node.get_child(0)
 	if not ss.has_method("set_cell_building"):
 		return
-	# The manager positions the building at hex_center + sub_offset, so
-	# node.global_position IS the world position to resolve to a grid cell.
+	# node.global_position IS the hex center (the manager places it there);
+	# resolve that to its grid cell.
 	var wp := node.global_position
-	ss.set_cell_building(Vector2(wp.x, wp.z), building_id, team, sub_q, sub_r)
+	ss.set_cell_building(Vector2(wp.x, wp.z), building_id, team, 0, 0, built)
 
 ## The old single-mesh version of this script wrote the whole terrain's
 ## collision into a CollisionShape3D sibling (under the parent StaticBody3D).

@@ -39,6 +39,9 @@ var sorted_indices_rid: RID
 var mm_buffer_rid: RID
 var cell_info_rid: RID
 var global_paths_rid: RID
+# Ping-ponged per-boid damage accumulators (uint per boid). Attackers
+# atomicAdd onto the write side; victims consume last frame's read side.
+var dmg_buffers: Array[RID] = []
 
 # uniform sets, ping-ponged where needed
 var uniform_sets_count: Array[RID] = []
@@ -67,11 +70,23 @@ var _elapsed_seconds: float = 0.0
 
 
 func _ready() -> void:
-	# The scene ships with instance_count = 0 so Godot doesn't serialize the
-	# whole instance buffer into the .tscn on save. Allocate the real count
-	# here — the GPU render pass fills every instance every frame anyway.
+	# The editor serializes the multimesh's instance buffer into the .tscn on
+	# every save (2+ MB of stale garbage). On load, that buffer's size can
+	# disagree with instance_count and the dots silently vanish. Force a clean
+	# reallocation: setting instance_count clears + re-zeroes the buffer, so
+	# whatever the editor saved is discarded before the GPU touches anything.
 	instance_count = multimesh.instance_count
+	if instance_count <= 0:
+		instance_count = 10766  # fallback default
+	multimesh.instance_count = 0
+	multimesh.instance_count = instance_count
 	total_groups = ceili(instance_count / 64.0)
+	# The compute shader writes instance transforms straight into the GPU
+	# buffer, so Godot never recomputes the multimesh's AABB from real
+	# positions. A zeroed (or garbage) buffer yields a degenerate/huge AABB:
+	# zeroed -> the whole swarm gets FRUSTUM-CULLED and every dot silently
+	# vanishes. Pin an AABB covering the world so it's never culled.
+	multimesh.custom_aabb = AABB(WORLD_MIN, WORLD_MAX - WORLD_MIN)
 
 	var world_size := WORLD_MAX - WORLD_MIN
 	grid_dims = Vector3i(
@@ -107,6 +122,8 @@ func _initial_dispatch() -> void:
 	# Run the full pipeline once at startup so mm_buffer has real positions
 	# before Godot renders the first frame (avoids center flash from garbage data).
 	rd.buffer_clear(cell_count_rid, 0, table_size * 4)
+	rd.buffer_clear(dmg_buffers[0], 0, instance_count * 4)
+	rd.buffer_clear(dmg_buffers[1], 0, instance_count * 4)
 	var push_bytes := _build_push_constants(0.0)
 	var cl = rd.compute_list_begin()
 
@@ -202,8 +219,11 @@ func _create_buffers() -> void:
 	#print(len(cell_hexes_bytes), " ", table_size)
 	cell_info_rid = rd.storage_buffer_create(table_size * 8, cell_hexes_bytes)
 
-	# std430 pads {vec4 pos; vec4 vel; uint state;} to 48 bytes (rounds up to 16-byte multiple)
-	var floats_per_boid := 16  # 4 (pos) + 4 (vel) + 1 (state) + 3 padding floats
+	# BoidState (std430): pos(16B) vel(16B) + 7 uints/int (28B) = 60B,
+	# rounded up to the vec4 alignment = 64 bytes = 16 floats per boid.
+	# CPU field order MUST match: pos(0-3) vel(4-7) state(8) path_hex(9)
+	# path_slot(10) team(11) health(12) home_hex(13) pad(14-15).
+	var floats_per_boid := 16
 	var state_bytes := instance_count * floats_per_boid * 4  # 48 bytes/boid
 
 	var init_state := PackedFloat32Array()
@@ -249,6 +269,11 @@ func _create_buffers() -> void:
 		health.resize(4)
 		health.encode_u32(0, 1000)
 		init_state[base + 12] = health.decode_float(0)
+		# home_hex: start = current hex (idles here until combat/path)
+		var hh := PackedByteArray()
+		hh.resize(4)
+		hh.encode_s32(0, hex_to_id(hex.x, hex.y))
+		init_state[base + 13] = hh.decode_float(0)
 
 
 
@@ -302,12 +327,21 @@ func _create_buffers() -> void:
 			health.resize(4)
 			health.encode_u32(0, 1000)
 			init_state[b + 12] = health.decode_float(0)
+			# home_hex = spawn hex
+			var shh := PackedByteArray()
+			shh.resize(4)
+			shh.encode_s32(0, hex_id)
+			init_state[b + 13] = shh.decode_float(0)
 
 	var init_bytes := init_state.to_byte_array()
 	#print(init_bytes)
 
 	state_buffers.append(rd.storage_buffer_create(state_bytes, init_bytes))
 	state_buffers.append(rd.storage_buffer_create(state_bytes, init_bytes))
+	# Damage accumulators: one uint per boid, ping-ponged like the state
+	# buffers. Zero-initialized (no data passed in).
+	dmg_buffers.append(rd.storage_buffer_create(instance_count * 4))
+	dmg_buffers.append(rd.storage_buffer_create(instance_count * 4))
 	# --- grid buffers, zero-initialized, sized exactly to grid_dims ---
 	cell_count_rid = rd.storage_buffer_create(table_size * 4)
 	cell_offset_rid = rd.storage_buffer_create(table_size * 4)
@@ -315,6 +349,8 @@ func _create_buffers() -> void:
 	sorted_indices_rid = rd.storage_buffer_create(instance_count * 4)
 
 	# Global paths: 4 teams per hex cell. Each team-hex has HexPaths struct (1368B)
+	# (path_count 4B + claim_chance 4B + 10 x 136B paths = 1368B; claim_chance
+	# defaults to 0.0 = "everyone may claim" until set_path_fraction overrides it)
 	var num_cells := hex_total_cells if hex_total_cells > 0 else (hex_grid_width * hex_grid_depth)
 	var global_paths_bytes := PackedByteArray()
 	global_paths_bytes.resize(num_cells * 4 * 1368)
@@ -348,6 +384,7 @@ func _build_uniform_sets() -> void:
 		))
 
 		# sim.glsl: binding0=read_state,1=write_state,2=cell_offset,3=cell_count,4=sorted_idx
+		# 5=cell_info,6=global_paths,7=dmg_write(this frame),8=dmg_read(last frame)
 		uniform_sets_sim.append(rd.uniform_set_create(
 			[
 				_make_uniform(0, state_buffers[parity]),
@@ -356,7 +393,9 @@ func _build_uniform_sets() -> void:
 				_make_uniform(3, cell_count_rid),
 				_make_uniform(4, sorted_indices_rid),
 				_make_uniform(5, cell_info_rid),
-				_make_uniform(6, global_paths_rid)
+				_make_uniform(6, global_paths_rid),
+				_make_uniform(7, dmg_buffers[other]),   # write side: becomes next frame's read
+				_make_uniform(8, dmg_buffers[parity]),  # read side: last frame's totals
 			],
 			shader_rids["sim"], 0
 		))
@@ -407,6 +446,9 @@ func _process(delta: float) -> void:
 	var write_i = 1 - frame_parity
 
 	rd.buffer_clear(cell_count_rid, 0, table_size * 4)
+	# Zero this frame's damage write-accumulator before attackers atomicAdd
+	# onto it. The read side holds last frame's totals - consumed, not cleared.
+	rd.buffer_clear(dmg_buffers[write_i], 0, instance_count * 4)
 
 	var push_bytes := _build_push_constants(delta)
 
@@ -458,6 +500,8 @@ func _exit_tree() -> void:
 	rd.free_rid(cell_offset_rid)
 	rd.free_rid(write_cursor_rid)
 	rd.free_rid(sorted_indices_rid)
+	for rid in dmg_buffers:
+		rd.free_rid(rid)
 	for rid in uniform_sets_count: rd.free_rid(rid)
 	for rid in uniform_sets_scatter: rd.free_rid(rid)
 	for rid in uniform_sets_sim: rd.free_rid(rid)
@@ -521,8 +565,11 @@ var _hex_path_counts: Dictionary = {}
 ## Writes the packed building info into the cell_info buffer for the grid
 ## cell containing `world_pos` (XZ). Replicated across all 4 team slices.
 ## building_id 0 = castle, 1 = tower, 2 = wall; pass -1 to clear.
-## Layout must match sim.glsl's CellInfo comments.
-func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: int, sub_r: int) -> void:
+## `built`: false = construction site (boids will march there and build it).
+## Layout must match sim.glsl's CellInfo comments - bit 31 is the BUILT flag.
+const BUILDING_BUILT_FLAG := 0x80000000
+
+func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: int, sub_r: int, built: bool = true) -> void:
 	var packed: int
 	if building_id < 0:
 		packed = 0xFF  # "none"
@@ -530,7 +577,9 @@ func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: i
 		packed = (building_id & 0xFF) \
 			| ((team & 0xFF) << 8) \
 			| ((clampi(sub_q, -3, 4) + 3 & 0xFF) << 16) \
-			| ((clampi(sub_r, -3, 4) + 3 & 0xFF) << 24)
+			| ((clampi(sub_r, -3, 4) + 3 & 0x7F) << 24)
+		if built:
+			packed |= BUILDING_BUILT_FLAG
 
 	# Which grid cell does this building's center fall in?
 	var cx := int(floor((world_pos.x - WORLD_MIN.x) / CELL_SIZE))
@@ -548,6 +597,32 @@ func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: i
 		var byte_off := (t * xz + cell_idx) * 8 + 4  # skip hex_id, write building
 		rd.buffer_update(cell_info_rid, byte_off, 4, buf)
 
+	# Remember where this building lives so get_building_build_state()
+	# can find it again when a boid finishes constructing it.
+	if building_id >= 0:
+		_building_sites[Vector2i(cx, cz)] = {"packed": packed, "world": world_pos}
+	else:
+		_building_sites.erase(Vector2i(cx, cz))
+
+## Per-cell building bookkeeping for the build flow:
+## Vector2i(cell_x, cell_z) -> {"packed": int, "world": Vector2}
+var _building_sites: Dictionary = {}
+
+## Reads the BUILT flag back from the GPU for the building in grid cell
+## (cx, cz). Returns true when a boid has finished constructing it, false
+## while it's still a site. Empty cell -> true (nothing to wait for).
+func is_building_built(cx: int, cz: int) -> bool:
+	var key := Vector2i(cx, cz)
+	if not _building_sites.has(key):
+		return true
+	var xz := grid_dims.x * grid_dims.z
+	var byte_off := (0 * xz + cz * grid_dims.x + cx) * 8 + 4  # team 0 slice
+	var data := rd.buffer_get_data(cell_info_rid, byte_off, 4)
+	if data.size() < 4:
+		return true
+	var packed := data.decode_u32(0)
+	return (packed & BUILDING_BUILT_FLAG) != 0
+
 ## Set the number of available paths stored for a given hex cell and team.
 func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:
 	team = clampi(team, 0, 3)
@@ -563,6 +638,21 @@ func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:
 	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * 4 * 1368
 	if hex_offset + 4 <= total_max:
 		rd.buffer_update(global_paths_rid, hex_offset, buf.size(), buf)
+
+## Set what fraction (0.0 - 1.0) of boids may claim paths on the hex at
+## (col, row) for `team`. 0 (or <= 0) means every boid may claim. Affects
+## only NEW claims - boids already following a path finish it.
+func set_path_fraction(col: int, row: int, team: int, fraction: float) -> void:
+	team = clampi(team, 0, 3)
+	var hex_id := hex_to_id(col, row)
+	var team_hex_idx := hex_id * 4 + team
+	var offset := team_hex_idx * 1368 + 4  # claim_chance sits after path_count
+	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * 4 * 1368
+	if offset + 4 <= total_max:
+		var buf := PackedByteArray()
+		buf.resize(4)
+		buf.encode_float(0, clampf(fraction, 0.0, 1.0))
+		rd.buffer_update(global_paths_rid, offset, 4, buf)
 
 
 ## Write a global path of world-space Vector2 points for a hex cell, team, and path slot.

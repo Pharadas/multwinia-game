@@ -112,6 +112,12 @@ var _draw_line: Line2D = null
 var _drawn_paths: Array[Line2D] = []
 const DRAW_SAMPLE_COUNT := 16
 
+## Percentage (0-100) of boids that should follow the next sent path.
+## Set by the slider that pops up after each drawn path; 100 = everyone.
+var _path_fraction_percent: int = 100
+var _fraction_slider: HSlider = null
+var _fraction_label: Label = null
+
 # Roads, keyed by an order-independent string so a drag from either end
 # finds the same road. Each entry stores the Line2D/marker nodes that make
 # up that road (so a single road can be removed without touching the rest)
@@ -121,7 +127,9 @@ var _connection_nodes: Array[Node] = [] # every Line2D/marker drawn so far, for 
 
 # --- Hex detail view state ---
 var _detail_view: HexDetailView = null
-## Buildings placed per parent hex: Vector2i(col,row) -> {Vector2i(sub_q,sub_r) -> building_id}
+## Buildings placed per parent hex: Vector2i(col,row) -> building_id
+## (whole-hex granularity - one building occupies an entire hex).
+## Legacy entries may still be {Vector2i(sub_q,sub_r) -> building_id} maps.
 var _hex_buildings: Dictionary = {}
 ## Node2D child of tile_map_layer that draws building markers on the grid.
 var _building_marker_layer: Node2D = null
@@ -193,6 +201,7 @@ func _on_reset_roads_pressed() -> void:
 func _on_draw_mode_toggled(pressed: bool) -> void:
 	_draw_mode = pressed
 	if not pressed and _draw_points.size() >= 2:
+		_show_fraction_slider()
 		_send_simplified_path()
 	_draw_points.clear()
 	if _draw_line:
@@ -259,14 +268,70 @@ func _send_simplified_path() -> void:
 	var ref_locals: Array = []
 	for c in ref_cells:
 		ref_locals.append(tile_map_layer.map_to_local(c))
-	_send_drawn_path_over_network(simplified, ref_cells, ref_locals)
+	_send_drawn_path_over_network(simplified, ref_cells, ref_locals, _path_fraction_percent / 100.0)
 
 
-func _send_drawn_path_over_network(points: Array, ref_cells: Array = [], ref_locals: Array = []) -> void:
+func _send_drawn_path_over_network(points: Array, ref_cells: Array = [], ref_locals: Array = [], fraction: float = 1.0) -> void:
 	var socket := _get_socket_node()
 	print("sending drawn path: ", points)
 	if socket and socket.has_method("send_drawn_path"):
-		socket.send_drawn_path(points, team_number, ref_cells, ref_locals)
+		socket.send_drawn_path(points, team_number, ref_cells, ref_locals, fraction)
+
+
+## Pops up a slider under the Draw Path button so the player can pick what
+## percentage of their boids follow the path they just drew. The value is
+## remembered for the NEXT path too (it only re-appears when a path is sent,
+## so re-tuning between draws is cheap). Dismiss with the Done button.
+func _show_fraction_slider() -> void:
+	if _fraction_slider:
+		_fraction_slider.get_parent().visible = true
+		return
+	var panel := PanelContainer.new()
+	panel.name = "PathFractionPanel"
+	panel.anchor_left = 0.0
+	panel.anchor_top = 0.0
+	panel.offset_left = 20.0
+	panel.offset_top = 80.0
+	panel.offset_right = 240.0
+	panel.offset_bottom = 140.0
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 2)
+	panel.add_child(vbox)
+
+	_fraction_label = Label.new()
+	_fraction_label.text = "Followers: %d%%" % _path_fraction_percent
+	vbox.add_child(_fraction_label)
+
+	var slider := HSlider.new()
+	slider.min_value = 0
+	slider.max_value = 100
+	slider.step = 5
+	slider.value = _path_fraction_percent
+	slider.value_changed.connect(_on_fraction_changed)
+	vbox.add_child(slider)
+
+	var done := Button.new()
+	done.text = "Done"
+	done.pressed.connect(_on_fraction_done)
+	vbox.add_child(done)
+
+	var canvas := get_node_or_null("PhoneUI")
+	if canvas == null:
+		return
+	canvas.add_child(panel)
+	_fraction_slider = slider
+
+
+func _on_fraction_changed(value: float) -> void:
+	_path_fraction_percent = int(value)
+	if _fraction_label:
+		_fraction_label.text = "Followers: %d%%" % _path_fraction_percent
+
+
+func _on_fraction_done() -> void:
+	if _fraction_slider:
+		_fraction_slider.get_parent().visible = false
 
 
 ## Rebuilds the grid straight from network data - an array of
@@ -616,27 +681,27 @@ func _open_hex_detail(cell: Vector2i) -> void:
 	_detail_view.z_index = 100
 	_detail_view.back_pressed.connect(_close_hex_detail)
 	_detail_view.building_placed.connect(_on_building_placed)
-	# Restore any buildings previously placed in this hex (local + synced).
-	var saved: Dictionary = _hex_buildings.get(cell, {})
-	if not saved.is_empty():
-		_detail_view.set_buildings(saved)
+	# Restore any building previously placed in this hex (local + synced).
+	var saved = _hex_buildings.get(cell, -1)
+	if typeof(saved) == TYPE_DICTIONARY and not saved.is_empty():
+		_detail_view.set_buildings(saved)  # legacy sub-hex map -> whole hex
+	elif saved is int:
+		_detail_view.set_building(saved)
 	add_child(_detail_view)
 
 
-## A building was dropped on sub-hex (sub_q, sub_r) of the open hex. Remember
-## it locally and forward it to the main screen, which spawns the 3D mesh.
-func _on_building_placed(sub_q: int, sub_r: int, building_id: int) -> void:
+## A building was dropped on the open hex (whole-hex placement). Remember it
+## locally and forward it to the main screen, which spawns the 3D mesh.
+func _on_building_placed(building_id: int) -> void:
 	if not _detail_view:
 		return
 	var cell := Vector2i(_detail_view.hex_col, _detail_view.hex_row)
-	var buildings: Dictionary = _hex_buildings.get(cell, {})
-	buildings[Vector2i(sub_q, sub_r)] = building_id
-	_hex_buildings[cell] = buildings
+	_hex_buildings[cell] = building_id
 	_update_building_markers()
 
 	var socket := _get_socket_node()
 	if socket and socket.has_method("send_building_placed"):
-		socket.send_building_placed(cell.x, cell.y, sub_q, sub_r, building_id, team_number)
+		socket.send_building_placed(cell.x, cell.y, building_id, team_number)
 
 
 ## Rebuilds (or creates) the Node2D that draws a small hexagonal marker on
@@ -653,19 +718,19 @@ func _update_building_markers() -> void:
 	var layer := _building_marker_layer
 	layer.queue_redraw()
 	# Rebind the draw callback to the latest data (replacing any old one).
+	# Whole-hex granularity: one marker covering the hex's center area.
 	layer.draw.connect(func():
 		var tile_sz := Vector2(tile_map_layer.tile_set.tile_size)
 		var hex_r: float = tile_sz.x / 2.0
-		var sub_r: float = hex_r / 4.0  # 3-ring honeycomb spans ~4 sub radii
 		for hex_cell in _hex_buildings:
-			var buildings: Dictionary = _hex_buildings[hex_cell]
+			var bid = _hex_buildings[hex_cell]
+			if bid is Dictionary:
+				# Legacy sub-hex entry: draw the first one at center.
+				if bid.is_empty():
+					continue
+				bid = bid.values()[0]
 			var base := tile_map_layer.map_to_local(hex_cell)
-			for sub_cell in buildings:
-				var bid: int = buildings[sub_cell]
-				var q = sub_cell.x
-				var r = sub_cell.y
-				var off := Vector2(sub_r * 1.5 * float(q), sub_r * sqrt(3.0) * (float(r) + float(q) * 0.5))
-				_draw_small_hex(layer, base + off, sub_r * 0.9, HexDetailView.BUILDING_COLORS.get(bid, Color.WHITE))
+			_draw_small_hex(layer, base, hex_r * 0.55, HexDetailView.BUILDING_COLORS.get(bid, Color.WHITE))
 	, CONNECT_REFERENCE_COUNTED)
 
 

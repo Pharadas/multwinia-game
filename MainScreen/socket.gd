@@ -71,11 +71,11 @@ signal new_road_remote(from_cell: Vector2i, to_cell: Vector2i)
 signal player_joined(team: int)
 
 ## Emitted when a phone sends a free-drawn path (simplified to 16 points).
-signal drawn_path_received(points: Array, team: int)
+signal drawn_path_received(points: Array, team: int, fraction: float)
 
-## Emitted when a phone drops a building on a sub-hex of a hex.
-## sub_q/sub_r are axial coords within that hex's own honeycomb (3 rings).
-signal building_placed_remote(col: int, row: int, sub_q: int, sub_r: int, building_id: int, team: int)
+## Emitted when a phone drops a building on a WHOLE hex (no sub-hex coords -
+## the building occupies the entire hex, centered on it).
+signal building_placed_remote(col: int, row: int, building_id: int, team: int)
 
 var _server := TCPServer.new()
 var _discovery_udp := PacketPeerUDP.new()
@@ -248,18 +248,17 @@ func _handle_message(msg, from_peer: PacketPeerStream) -> void:
 			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
 			var ref_cells: Array = msg.get("ref_cells", [])
 			var ref_locals: Array = msg.get("ref_locals", [])
+			var fraction: float = msg.get("fraction", 1.0)
 			var world_points := _tilemap_points_to_world(points, ref_cells, ref_locals)
 			print("receiving path: ", world_points)
-			drawn_path_received.emit(world_points, team_number)
+			drawn_path_received.emit(world_points, team_number, fraction)
 
 		"building_placed":
 			var col: int = msg.col
 			var row: int = msg.row
-			var sub_q: int = msg.sub_q
-			var sub_r: int = msg.sub_r
 			var building_id: int = msg.building
 			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
-			building_placed_remote.emit(col, row, sub_q, sub_r, building_id, team_number)
+			building_placed_remote.emit(col, row, building_id, team_number)
 
 
 func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array) -> Array:
