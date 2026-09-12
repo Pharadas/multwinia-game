@@ -12,6 +12,8 @@ struct BoidState {
     int home_hex;
 };
 
+#define STATE_CHARGING 0x00000040u  // dying dot about to explode (matches sim.glsl)
+
 struct InstanceData {
     vec4 row1; vec4 row2; vec4 row3; vec4 color;
 };
@@ -52,13 +54,35 @@ void main() {
     mm_buffer.instances[id].row2 = vec4(right.y, up.y, fwd.y, pos.y);
     mm_buffer.instances[id].row3 = vec4(right.z, up.z, fwd.z, pos.z);
 
-    // Color by team index (0..3)
+    // Color by team index. First 4 teams get fixed recognizable colors;
+    // teams 4+ get evenly spaced hues so any team count works. Team id is
+    // masked to num_teams first so a corrupt id can't index out of range.
+    // The LAST team index is the NPC horde (deserters) - always rendered
+    // dark gray-violet regardless of team count, so it never collides with
+    // a player team's generated hue.
     uint boid_team = state.boids[id].team;
-    vec4 team_colors[4] = vec4[4](
-        vec4(0.9, 0.2, 0.2, 1.0), // Team 0: Red
-        vec4(0.2, 0.8, 0.2, 1.0), // Team 1: Green
-        vec4(0.2, 0.4, 0.9, 1.0), // Team 2: Blue
-        vec4(0.9, 0.8, 0.2, 1.0)  // Team 3: Yellow
-    );
-    mm_buffer.instances[id].color = team_colors[boid_team % 4u];
+    uint nt = uint((pc.grid_dims.w > 0) ? pc.grid_dims.w : 4);
+    uint t = boid_team % nt;
+    vec4 c;
+    if (t == nt - 1u) c = vec4(0.42, 0.38, 0.46, 1.0); // NPC horde: rogue
+    else if (t == 0u) c = vec4(0.9, 0.2, 0.2, 1.0);    // Team 0: Red
+    else if (t == 1u) c = vec4(0.2, 0.8, 0.2, 1.0);    // Team 1: Green
+    else if (t == 2u) c = vec4(0.2, 0.4, 0.9, 1.0);    // Team 2: Blue
+    else if (t == 3u) c = vec4(0.9, 0.8, 0.2, 1.0);    // Team 3: Yellow
+    else {
+        // Evenly spaced hue around the wheel for teams 4..nt-2.
+        float frac = float(t - 4u) / float(max(nt - 5u, 1u));
+        c = vec4(fract(frac + 0.08), 0.75, 0.55, 1.0);
+    }
+
+    // CHARGING (about to explode): strobe white faster as the fuse burns
+    // down - the classic warning blink. The fuse deadline (sim seconds)
+    // is packed in the slot field; flash period shrinks as time runs out.
+    if ((state.boids[id].state & STATE_CHARGING) != 0u) {
+        float remaining = float(state.boids[id].assigned_path_slot) - pc.params.w;
+        float period = clamp(remaining * 0.4, 0.1, 0.4);
+        float flash = fract(pc.params.w / period) < 0.5 ? 1.0 : 0.25;
+        c = vec4(flash, flash, flash, 1.0);
+    }
+    mm_buffer.instances[id].color = c;
 }

@@ -41,6 +41,11 @@ signal terrain_ready
 ## is on.
 @export var gpu_swarms_per_team: int = 1
 
+## How many dots each team starts with in the GPU swarm. Both teams use the
+## same starting count, so the total army is 2 * dots_per_team. The sim caps
+## it to the multimesh instance budget automatically.
+@export_range(0, 200000, 1) var dots_per_team: int = 500
+
 ## Chance that an interior hex tile - outside the outermost ring and the
 ## team corner bases, which are always structured - becomes a solid wall.
 ## A wall tile covers its whole hexagon and nobody can pass through it - a
@@ -127,6 +132,38 @@ func _connect_sim_signals() -> void:
 	var ss = ss_node.get_child(0)
 	if ss.has_signal("mine_collapsed") and not ss.mine_collapsed.is_connected(_on_mine_collapsed):
 		ss.mine_collapsed.connect(_on_mine_collapsed)
+	# Mine ownership changes drive the 3D building color + phone tile color.
+	if ss.has_signal("mine_owner_changed") and not ss.mine_owner_changed.is_connected(_on_mine_owner_changed):
+		ss.mine_owner_changed.connect(_on_mine_owner_changed)
+	if ss.has_signal("resources_changed") and not ss.resources_changed.is_connected(_on_resources_changed):
+		ss.resources_changed.connect(_on_resources_changed)
+	# Size the sim's team slots to the socket's playable team count plus the
+	# reserved NPC horde slot, so both sides always agree. No-op after start.
+	var socket := get_node_or_null("Socket")
+	if socket != null and "max_teams" in socket and ss.has_method("set_num_teams"):
+		ss.set_num_teams(int(socket.max_teams) + 1)
+	if ss.has_method("set_dot_count_per_team"):
+		ss.set_dot_count_per_team(dots_per_team)
+	# Give any already-connected phone the current pools immediately.
+	if ss.has_method("get_team_resources"):
+		_send_resources_to_phones(ss.get_team_resources())
+
+
+## The sim's resource pools changed (once per economy tick): broadcast them
+## so every phone can show its own team's amount.
+func _on_resources_changed(resources: Array) -> void:
+	_send_resources_to_phones(resources)
+
+
+func _send_resources_to_phones(resources: Array) -> void:
+	var socket := get_node_or_null("Socket")
+	if socket == null or not socket.has_method("broadcast_team_resources"):
+		return
+	# Broadcast every pool EXCEPT the sim's reserved NPC horde slot (last
+	# index) - deserters don't own resources and no phone is that team.
+	var player_pools: int = maxi(resources.size() - 1, 0)
+	for t in range(player_pools):
+		socket.broadcast_team_resources(t, float(resources[t]))
 
 
 ## A depleted mine's ground tile collapsed: remove the building mesh and
@@ -167,12 +204,97 @@ func _on_drawn_path_received(points: Array, team: int, fraction: float = 1.0) ->
 	if points.is_empty():
 		print("no points to draw path!")
 		return
-	ss.set_path(points, 0, 0, team)
+	var slot: int = ss.set_path(points, 0, 0, team)
 	# Apply the follower percentage to every hex the path starts from - boids
 	# claim paths at the path's start hex, so that's where the gate lives.
 	var start_hex: Vector2i = ss.world_to_hex(Vector2(points[0].x, points[0].y))
 	ss.set_path_fraction(start_hex.x, start_hex.y, team, fraction)
 	print("Global path set: %d points for team %d (fraction %.2f)" % [points.size(), team, fraction])
+	# Persistent 3D ribbon: stays until the path expires AND every boid that
+	# claimed it has arrived (GPU follower count hits zero).
+	if slot >= 0:
+		var hex_id: int = ss.hex_to_id(start_hex.x, start_hex.y)
+		_spawn_path_visual(points, hex_id, team, slot, ss.get_path_expiry(hex_id, team, slot))
+
+
+# ---- drawn path visuals -----------------------------------------------------
+## One entry per drawn path: {mesh, hex_id, team, slot, expiry}. The ribbon
+## stays visible until the path expires AND no boids are following it
+## (count.glsl's per-slot follower counters hit zero).
+var _path_visuals: Array = []
+var _path_visual_timer := 0.0
+
+
+func _spawn_path_visual(points: Array, hex_id: int, team: int, slot: int, expiry: float) -> void:
+	var imm := ImmediateMesh.new()
+	imm.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	var width := 0.8
+	var height := 1.5
+	var prev := Vector3.INF
+	for p in points:
+		var cur := Vector3(float(p.x), height, float(p.y))
+		if prev != Vector3.INF:
+			var dir := cur - prev
+			dir.y = 0.0
+			if dir.length() > 0.01:
+				var n := Vector3(-dir.z, 0.0, dir.x).normalized() * (width * 0.5)
+				imm.surface_add_vertex(prev - n)
+				imm.surface_add_vertex(prev + n)
+				imm.surface_add_vertex(cur + n)
+				imm.surface_add_vertex(prev - n)
+				imm.surface_add_vertex(cur + n)
+				imm.surface_add_vertex(cur - n)
+		prev = cur
+	imm.surface_end()
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	match team % 4:
+		0: mat.albedo_color = Color(1.0, 0.25, 0.25, 0.65)
+		1: mat.albedo_color = Color(0.25, 1.0, 0.25, 0.65)
+		2: mat.albedo_color = Color(0.3, 0.5, 1.0, 0.65)
+		_: mat.albedo_color = Color(1.0, 0.9, 0.25, 0.65)
+	var mi := MeshInstance3D.new()
+	mi.mesh = imm
+	mi.material_override = mat
+	add_child(mi)
+	_path_visuals.append({"mesh": mi, "hex_id": hex_id, "team": team, "slot": slot, "expiry": expiry})
+
+
+## Every 0.5 s: free a path ribbon once its expiry has passed AND the GPU
+## reports no boids still following its (hex, team, slot) - i.e. every unit
+## that claimed it has arrived. While stragglers remain, an expired path
+## fades to 25% so it's clear no NEW boids can claim it.
+func _update_path_visuals(delta: float) -> void:
+	if _path_visuals.is_empty():
+		return
+	_path_visual_timer += delta
+	if _path_visual_timer < 0.5:
+		return
+	_path_visual_timer = 0.0
+	var ss_node := get_node_or_null("StupidSimple")
+	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	if ss == null or not ss.has_method("get_path_followers"):
+		return
+	var now: float = ss._elapsed_seconds
+	var i := _path_visuals.size() - 1
+	while i >= 0:
+		var v: Dictionary = _path_visuals[i]
+		var mi: MeshInstance3D = v.mesh
+		if not is_instance_valid(mi):
+			_path_visuals.remove_at(i)
+		else:
+			var expired: bool = float(v.expiry) > 0.0 and now > float(v.expiry)
+			if expired:
+				var followers: int = ss.get_path_followers(int(v.hex_id), int(v.team), int(v.slot))
+				if followers <= 0:
+					mi.queue_free()
+					_path_visuals.remove_at(i)
+				else:
+					var m := mi.material_override as StandardMaterial3D
+					if m and m.albedo_color.a > 0.3:
+						m.albedo_color.a = 0.25
+		i -= 1
 
 
 ## A phone dropped a building on hex (col, row) as a WHOLE. It starts as a
@@ -180,6 +302,16 @@ func _on_drawn_path_received(points: Array, team: int, fraction: float = 1.0) ->
 ## Boids from the owning team march there and flip the flag (sim.glsl's
 ## construction block); a poll timer then swaps in the full-size mesh.
 func _on_building_placed_remote(col: int, row: int, building_id: int, team: int) -> void:
+	# PAY FIRST: walls cost the placing team 100 resources. A team that
+	# can't afford it gets nothing - no ghost, no GPU site, no refund.
+	var ss_node := get_node_or_null("StupidSimple")
+	var ss_pay = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	if ss_pay and ss_pay.has_method("can_afford_building") and not ss_pay.can_afford_building(building_id, team):
+		print("Placement rejected: team %d can't afford building %d" % [team, building_id])
+		return
+	if ss_pay and ss_pay.has_method("charge_building"):
+		ss_pay.charge_building(building_id, team)
+
 	var mgr := get_node_or_null("HexBuildingManager")
 	if not mgr:
 		mgr = HexBuildingManager.new()
@@ -195,8 +327,10 @@ func _on_building_placed_remote(col: int, row: int, building_id: int, team: int)
 	# Push the UNBUILT building into the GPU cell_info buffer (sim.glsl reads
 	# it and sends builders). The building occupies its hex center.
 	_push_building_to_cell_info(col, row, building_id, team, node, false)
-	# Track the site so the poll can complete it later.
-	_pending_builds.append({"node": node, "building_id": building_id, "team": team})
+	# Track the site so the poll can complete it later. placed_at feeds the
+	# builder-count estimate: build work is fixed, so a site that finished
+	# fast must have had many dots building it (drives the grow animation).
+	_pending_builds.append({"node": node, "building_id": building_id, "team": team, "placed_at": Time.get_ticks_msec()})
 	if _build_poll_timer == null:
 		_build_poll_timer = Timer.new()
 		_build_poll_timer.wait_time = 0.5
@@ -229,7 +363,18 @@ func _poll_building_builds() -> void:
 			var cz := int(floor((wp.z - ss.WORLD_MIN.z) / ss.CELL_SIZE))
 			if ss.is_building_built(cx, cz):
 				if mgr and mgr.has_method("set_built"):
-					mgr.set_built(node)
+					# Builder estimate: total work is fixed (BUILD_WORK = 200
+					# builder-frames in sim.glsl), so work / elapsed frames
+					# = how many dots were building simultaneously. Feeds the
+					# grow-animation speed (crowds build -> fast growth).
+					var elapsed_s := float(Time.get_ticks_msec() - int(site.get("placed_at", Time.get_ticks_msec()))) / 1000.0
+					# Build work is fixed per building type (sim.glsl: 200
+					# builder-frames for most, 600 for walls = ~10s), so
+					# work / elapsed frames = how many dots were building
+					# simultaneously (drives the grow animation speed).
+					var total_work := 600.0 if int(site.get("building_id", -1)) == 2 else 200.0
+					var builders := clampi(roundi(total_work / maxf(elapsed_s * 60.0, 1.0)), 1, 50)
+					mgr.set_built(node, builders)
 				# Re-mark the buffer built (boid already did it, this keeps
 				# CPU/GPU in sync if the buffer was re-uploaded meanwhile).
 				if ss.has_method("set_cell_building"):
@@ -238,6 +383,31 @@ func _poll_building_builds() -> void:
 		i -= 1
 	if _pending_builds.is_empty() and _build_poll_timer:
 		_build_poll_timer.stop()
+
+
+## A mine was captured (from neutral or stolen from another team). Recolor
+## its 3D building mesh to the new owner's team color.
+func _on_mine_owner_changed(cell: Vector2i, world_pos: Vector2, team: int) -> void:
+	var mgr := get_node_or_null("HexBuildingManager")
+	if mgr == null or not mgr.has_method("recolor_building_at"):
+		return
+	var hex := _hex_of_world(Vector2(world_pos.x, world_pos.y))
+	if hex.x < 0:
+		return
+	mgr.recolor_building_at(hex, team)
+
+
+## Nearest hex to a world-space XZ point (Vector2 = x, z), or (-1,-1).
+func _hex_of_world(world_pos: Vector2) -> Vector2i:
+	var best := Vector2i(-1, -1)
+	var best_d := INF
+	for key in hex_nodes.keys():
+		var tile: HexTile = hex_nodes[key]
+		var d := tile.global_position.distance_squared_to(Vector3(world_pos.x, tile.global_position.y, world_pos.y))
+		if d < best_d:
+			best_d = d
+			best = key
+	return best
 
 
 ## Writes packed info into the cell covering the hex's center. Buildings are
@@ -676,6 +846,7 @@ func make_new_lattice_swarm(pos: Vector3, team: int, dot_count: int = 256) -> vo
 
 
 func _process(delta: float) -> void:
+	_update_path_visuals(delta)
 	# Keep the crate supply going: drop a new one every so often, but never
 	# stack multiple crates at once.
 	if hex_nodes.is_empty():
@@ -688,7 +859,38 @@ func _process(delta: float) -> void:
 
 
 func _on_terrain_ready() -> void:
-	pass
+	# Mirror the terrain's wall hexes into the sim's cell_info buffer so
+	# GPU-side boids actually collide with them. The shader's wall-block
+	# only knows walls written to that buffer - without this it only ever
+	# saw player-placed buildings, so dots walked straight through every
+	# terrain wall. Team byte 255 = "terrain": it blocks every team, and
+	# sim.glsl's hostile-building scan skips walls with that team so boids
+	# don't march on the map's own scenery.
+	var ss_node := get_node_or_null("StupidSimple")
+	if ss_node == null or ss_node.get_child_count() == 0:
+		return
+	var ss = ss_node.get_child(0)
+	# Bulk path: one read + one write of the whole cell_info buffer (~800
+	# walls). Per-tile buffer_update calls stalled startup badly.
+	if ss.has_method("set_terrain_walls"):
+		var walls: Array = []
+		for key in hex_nodes:
+			var tile: HexTile = hex_nodes[key]
+			if tile == null or not tile.is_wall:
+				continue
+			var center := get_hex_center(key.x, key.y)
+			walls.append(Vector2(center.x, center.z))
+		ss.set_terrain_walls(walls)
+		return
+	# Fallback: per-tile writes (older sim without the bulk method).
+	if not ss.has_method("set_cell_building"):
+		return
+	for key in hex_nodes:
+		var tile: HexTile = hex_nodes[key]
+		if tile == null or not tile.is_wall:
+			continue
+		var center := get_hex_center(key.x, key.y)
+		ss.set_cell_building(Vector2(center.x, center.z), 2, 255, 0, 0, true)
 	# _spawn_drop_box()
 
 

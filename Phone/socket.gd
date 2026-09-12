@@ -45,6 +45,9 @@ class_name HexGrid2DSocket
 ## Emitted whenever a "terrain" message arrives, in case anything else wants
 ## the raw tile array without going through HexGrid2D.
 signal terrain_received(tiles: Array)
+## Emitted whenever the 3D side broadcasts a team's resource pool (once per
+## economy tick). `amount` is this phone's team's current resource count.
+signal team_resources_received(team: int, amount: float)
 
 ## Exact bytes expected on each side of the discovery handshake - see
 ## matching constants in HexTerrainSocket.
@@ -207,6 +210,13 @@ func _handle_message(msg) -> void:
 		print("HexGrid2DSocket: assigned team %d." % team)
 		if grid_2d:
 			grid_2d.team_number = team
+		return
+
+	# Once-per-second economy updates from the main screen: how many
+	# resources each team holds. The phone view displays its own team's
+	# amount (see main_phone_view.gd).
+	if msg.type == "team_resources":
+		team_resources_received.emit(int(msg.team), float(msg.amount))
 		return
 
 ## Called by HexGrid2D when a cell is clicked - tells the 3D side which

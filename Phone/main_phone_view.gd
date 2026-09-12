@@ -90,6 +90,11 @@ signal tiles_disconnected(from_cell: Vector2i, to_cell: Vector2i)
 
 var team_number: int
 
+## Live resource pool for this phone's team, pushed from the 3D side once
+## per economy tick. -1 = nothing received yet (label shows a dash).
+var _team_resources: float = -1.0
+var _resource_label: Label
+
 var _terrain: Node = null
 var _cell_colors: Dictionary = {} # Vector2i(col, row) -> Color, from network data
 var _cell_counts: Dictionary = {} # Vector2i(col, row) -> int (darwinian count), from network data
@@ -155,6 +160,11 @@ func _ready() -> void:
 
 	_setup_ui()
 	populate()
+	# Show this team's resource pool (broadcast by the main screen's economy
+	# tick once per second).
+	var socket := _get_socket_node()
+	if socket and socket.has_signal("team_resources_received"):
+		socket.team_resources_received.connect(_on_team_resources_received)
 	# Keep the grid filling the screen no matter the device or orientation -
 	# re-fit whenever the viewport changes size.
 	get_viewport().size_changed.connect(_fit_to_screen)
@@ -195,6 +205,27 @@ func _setup_ui() -> void:
 	draw_btn.toggled.connect(_on_draw_mode_toggled)
 	canvas.add_child(draw_btn)
 
+	# Resource counter for this team, centered in the top bar between the
+	# Draw Path button and Reset All Roads.
+	_resource_label = Label.new()
+	_resource_label.name = "ResourceLabel"
+	_resource_label.text = "-resources-"
+	_resource_label.anchor_left = 0.5
+	_resource_label.anchor_top = 0.0
+	_resource_label.anchor_right = 0.5
+	_resource_label.anchor_bottom = 0.0
+	_resource_label.offset_left = -80.0
+	_resource_label.offset_top = 20.0
+	_resource_label.offset_right = 80.0
+	_resource_label.offset_bottom = 70.0
+	_resource_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_resource_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_resource_label.add_theme_font_size_override("font_size", 28)
+	_resource_label.add_theme_color_override("font_color", Color(1.0, 0.85, 0.2))
+	_resource_label.add_theme_color_override("font_outline_color", Color.BLACK)
+	_resource_label.add_theme_constant_override("outline_size", 6)
+	canvas.add_child(_resource_label)
+
 	## Bottom bar: the three building chips, always visible. Press a chip to
 	## pick the building up, drag onto the grid, release on a hex to place it.
 	var palette := PanelContainer.new()
@@ -225,14 +256,36 @@ func _on_reset_roads_pressed() -> void:
 	_send_reset_roads_over_network()
 
 
+## The main screen broadcasts each team's resource pool once per economy
+## tick - keep only this phone's team's amount on screen.
+func _on_team_resources_received(team: int, amount: float) -> void:
+	if team != team_number:
+		return
+	_team_resources = amount
+	if _resource_label:
+		_resource_label.text = "◆ %d" % int(floor(amount))
+
+
 func _on_draw_mode_toggled(pressed: bool) -> void:
 	_draw_mode = pressed
 	if not pressed and _draw_points.size() >= 2:
 		_show_fraction_slider()
 		_send_simplified_path()
+		_draw_points.clear()
+		_finalize_draw_stroke()
+	elif not pressed:
+		# Toggled off mid-stroke (or with an empty stroke) - still retire the
+		# line so nothing lingers in the drawing state.
+		_finalize_draw_stroke()
 	_draw_points.clear()
+
+
+## Seals the in-progress stroke as a permanent line on the map and resets
+## the draw state, so the next stroke starts a fresh Line2D instead of
+## overwriting this one. Called after every sent path (touch, mouse and
+## toggle-off all funnel through here).
+func _finalize_draw_stroke() -> void:
 	if _draw_line:
-		# Keep the line visible as a completed path
 		_draw_line.default_color = Color(1.0, 0.3, 0.3, 0.6)
 		_drawn_paths.append(_draw_line)
 		_draw_line = null
@@ -897,10 +950,11 @@ func _unhandled_input(event: InputEvent) -> void:
 				if _draw_points.size() >= 2:
 					_send_simplified_path()
 					_draw_points.clear()
+				_finalize_draw_stroke()
 			else:
 				_end_drag()
 			_touch_active = false
-		return
+			return
 
 	if event is InputEventScreenDrag:
 		if event.index != 0:
@@ -934,6 +988,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				if _draw_points.size() >= 2:
 					_send_simplified_path()
 					_draw_points.clear()
+				_finalize_draw_stroke()
 			else:
 				_end_drag()
 

@@ -33,6 +33,10 @@ class_name HexTerrainSocket
 ## Highest number of simultaneous teams/phones this supports - team numbers
 ## handed out by _assign_team() are always in range(max_teams). Must match
 ## the 4 corner bases main_screen.gd's _compute_team_bases() builds.
+## How many teams get handed out to phones. Team ids run 0..max_teams-1.
+## NOTE: the GPU sim reserves one extra slot ABOVE these as the NPC horde
+## (deserters) - a phone is never that team. The sim must run with
+## num_teams = max_teams + 1 for the horde to exist.
 @export var max_teams: int = 4
 
 ## Port the UDP discovery responder listens on. Must match every phone's
@@ -345,6 +349,14 @@ func _broadcast(msg: Dictionary, except_peer: PacketPeerStream = null) -> void:
 		var peer: PacketPeerStream = client.peer
 		if peer != except_peer:
 			peer.put_var(msg)
+
+
+## Pushes one team's current resource pool to every connected phone so the
+## player UI can display it. Called once per economy tick by main_screen -
+## a phone that connects mid-game picks up its team's amount within a
+## second, so no explicit request/response handshake is needed.
+func broadcast_team_resources(team: int, amount: float) -> void:
+	_broadcast({"type": "team_resources", "team": team, "amount": amount})
 
 
 ## Call this once generate_terrain() finishes (or whenever the terrain

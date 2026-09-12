@@ -16,6 +16,7 @@ layout(set=0, binding=0, std430) buffer StateBuf { BoidState boids[]; } state;
 layout(set=0, binding=1, std430) buffer WriteCursor { uint cursor[]; } write_cursor;
 layout(set=0, binding=2, std430) buffer SortedIdx { uint idx[]; } sorted;
 layout(push_constant) uniform PC {
+    // grid_dims.w = num_teams - every team-indexed buffer/loop keys off it.
     vec4 params; vec4 world_min; ivec4 grid_dims;
     vec4 hex_params; ivec4 hex_grid;
 } pc;
@@ -35,7 +36,7 @@ void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uint(pc.params.y)) return;
     if (state.boids[id].health == 0u) return;
-    int team = int(state.boids[id].team) % 4;
+    int team = int(state.boids[id].team) % ((pc.grid_dims.w > 0) ? pc.grid_dims.w : 4);
     ivec3 cell = get_cell(state.boids[id].pos.xyz, pc.world_min.xyz, pc.params.z);
     uint h = cell_index(team, cell, pc.grid_dims.xyz);
     uint slot = atomicAdd(write_cursor.cursor[h], 1);
