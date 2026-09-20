@@ -20,7 +20,7 @@ class_name HexBuildingManager
 ## terrain height instead of a flat plane. Optional.
 @export var terrain_path: NodePath
 
-# Building ids - must match HexDetailView.BUILDING_NAMES keys on the phone.
+# Building ids - must match BuildingTypes on the phone and sim.glsl's ids.
 const BUILDING_BARRACK := 0
 const BUILDING_MINE := 1
 const BUILDING_WALL := 2

@@ -219,45 +219,29 @@ func _handle_message(msg) -> void:
 		team_resources_received.emit(int(msg.team), float(msg.amount))
 		return
 
-## Called by HexGrid2D when a cell is clicked - tells the 3D side which
-## tile to run its click function on.
+	# A mine hex collapsed on the 3D side: erase it from the 2D map and
+	# recompute the mining frontier (new outermost ring becomes placeable).
+	if msg.type == "hex_destroyed":
+		if grid_2d and grid_2d.has_method("notify_hex_destroyed"):
+			grid_2d.notify_hex_destroyed(int(msg.col), int(msg.row))
+		return
+
+## Called by HexGrid2D when a cell is clicked (tap or hover) - tells the
+## 3D side which tile to run its click function on.
 func send_tile_clicked(col: int, row: int, team_number: int) -> void:
 	#print("sending info col and row from phone socket!")
 	if _peer and _was_connected:
 		_peer.put_var({"type": "tile_clicked", "col": col, "row": row, "team": team_number})
-## Called by HexGrid2D when the local player connects two tiles - tells the
-## server, which applies it to the 3D terrain and rebroadcasts it to every
-## OTHER connected phone.
-func send_new_connection(from_cell: Vector2i, to_cell: Vector2i, team_number: int, path: Array = []) -> void:
-	print("sending new connection from phone socket!", from_cell, to_cell)
-	if _peer and _was_connected:
-		_peer.put_var({"type": "new_road", "from_cell": from_cell, "to_cell": to_cell, "team": team_number, "path": path})
-## Called by HexGrid2D when a road is removed - mirror of
-## send_new_connection() for deletions. Type string matches
-## HexTerrainSocket's "remove_road" match arm.
-func send_connection_removed(from_cell: Vector2i, to_cell: Vector2i, team_number: int) -> void:
-	print("sending connection removal from phone socket!", from_cell, to_cell)
-	if _peer and _was_connected:
-		_peer.put_var({"type": "remove_road", "from_cell": from_cell, "to_cell": to_cell, "team": team_number})
-
-## Called by HexGrid2D when the player clicks the reset roads button - tells the
-## server to remove all roads for this team.
-func send_clear_roads(team_number: int) -> void:
-	print("sending clear roads request from phone socket for team ", team_number)
-	if _peer and _was_connected:
-		_peer.put_var({"type": "clear_roads", "team": team_number})
-
-## Called by HexGrid2D when a free-drawn path is simplified to 16 points.
-## Sends the tilemap-local positions plus reference cell mappings to the main screen.
-## `fraction` (0..1) is what percentage of boids should follow this path
-## (1.0 = everyone).
+## Called by HexGrid2D when the player draws a path on the 2D grid - tells
+## the 3D side to set it as the team's active path (simplified to 16
+## points).
 func send_drawn_path(points: Array, team_number: int, ref_cells: Array = [], ref_locals: Array = [], fraction: float = 1.0) -> void:
 	if _peer and _was_connected:
 		_peer.put_var({"type": "drawn_path", "points": points, "team": team_number, "ref_cells": ref_cells, "ref_locals": ref_locals, "fraction": fraction})
 
-## Called by HexDetailView when a building is dropped on the open hex.
+## Called by the building flow when a building is dropped on a hex.
 ## Whole-hex granularity: the main screen places the 3D mesh centered on
-## that hex - there are no sub-hex coordinates anymore.
+## that hex - there are no sub-hex coordinates.
 func send_building_placed(col: int, row: int, building_id: int, team_number: int) -> void:
 	if _peer and _was_connected:
 		_peer.put_var({"type": "building_placed", "col": col, "row": row, "building": building_id, "team": team_number})

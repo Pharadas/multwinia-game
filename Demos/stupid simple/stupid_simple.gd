@@ -50,6 +50,27 @@ var econ_stats_rid: RID
 # time. Hex-indexed (not cell-indexed) so the whole hexagon is lethal.
 var collapse_rid: RID
 var collapse_rid_size: int = 0
+# Terrain heightfield uploaded from the main screen's NoiseTexture2D (see
+# set_heightmap). Layout matches sim.glsl's HeightmapBuf: a 4-float header
+# (map_w, map_h, height_scale, pad) followed by row-major RED samples;
+# sim.glsl's terrain_height() bilinearly interpolates them so ground dots
+# rest on the visible terrain. A 16-byte zero placeholder exists from
+# startup (map_w == 0 -> flat-floor fallback) until the real upload lands.
+var heightmap_rid: RID
+var heightmap_width: int = 0   # image width in texels (0 = no upload yet)
+var heightmap_depth: int = 0   # image height in texels
+## Height scale pushed to the shaders every frame (sim.glsl's terrain_height
+## rebuilds HexTile._sample_height's `r * 4.0 * height_scale` with it).
+var terrain_height_scale: float = 10.0
+## CPU copy of the uploaded samples (4-float header + w*h floats, same
+## layout as the GPU buffer) so get_ground_height() can query heights
+## without a per-call GPU readback.
+var _heightmap_cpu := PackedFloat32Array()
+## Retired heightmap buffers from previous uploads. They must stay alive
+## until the uniform sets binding them are freed - freeing a buffer that a
+## uniform set references invalidates that set's RID (RenderingDevice
+## dependency tracking), which crashed the uniform-set rebuild.
+var _heightmap_retired: Array[RID] = []
 # Ping-ponged per-boid damage accumulators (uint per boid). Attackers
 # atomicAdd onto the write side; victims consume last frame's read side.
 var dmg_buffers: Array[RID] = []
@@ -97,7 +118,7 @@ var _dots_per_team: int = 0
 ## deserters. No phone is ever assigned it, no boid spawns in it, but
 ## starving boids randomly defect into it and it fights everyone. Player
 ## teams are 0..num_teams - 2.
-var num_teams: int = 5
+var num_teams: int = 3
 
 ## How fast broke teams bleed units to the horde. Each in-debt boid converts
 ## with per-frame chance min(deficit * DESERTION_RATE, 0.0005) (plus a slow
@@ -111,12 +132,37 @@ const DESERTION_RATE := 0.0000015
 ## sim.glsl to check path expiry timestamps.
 var _elapsed_seconds: float = 0.0
 
+## Last sim timestamp (params.w * 256, truncated to 24 bits) at which the
+## CPU read the explosion buffer - read_explosions() reports only blasts
+## detonated after this, so each blast yields exactly one
+## explosion_occurred signal. 1/256 s resolution matches sim.glsl.
+var _last_blast_read_time := 0.0
+
+## Cached BLAST_TTL copy (sim.glsl's BLAST_TTL = 0.4 s): blasts stay fresh
+## in the slot list this long and are re-reported every frame while young.
+const BLAST_TTL := 0.4
+
 ## How long a freshly-set path stays claimable, in seconds. Claimant boids
 ## finish their path regardless of expiry (see sim.glsl soft-expiry comment).
 ## Short-lived by design: paths fade fast, new claims pick fresh ones.
 @export var path_lifetime := 10.0
 
 # ---- economy -------------------------------------------------------------------
+## ---- SPECIAL CENTER MINE + MINERS ------------------------------------------
+## The map center hosts a permanent special mine worth 3x a normal mine,
+## guarded by MINER_COUNT miner dots that never leave its hexagon. The mine
+## is a regular neutral mine (capture rules apply) but its lifetime never
+## counts down, and its owner earns SPECIAL_MINE_BONUS per living miner on
+## top of the normal MINE_INCOME. Miners are NPC-team dots (team
+## num_teams - 1) flagged STATE_MINER, so upkeep, starvation, desertion and
+## captures never touch them - but everyone can melee them down to grab the
+## mine. Dead miners respawn at the mine every MINER_RESPAWN_INTERVAL.
+const MINER_COUNT := 7
+const SPECIAL_MINE_BONUS := 100.0  # 3x a normal mine: 50 base + 2x50 bonus
+const MINER_RESPAWN_INTERVAL := 3.0
+const STATE_MINER_FLAG := 0x80     # must match sim.glsl's STATE_MINER bit
+const MINER_HEALTH := 3000         # 10x a regular dot: takes focused raids
+
 const MINE_INCOME := 50.0          # resources per second per owned mine
 const UPKEEP_PER_SEC := 0.2       # each dot costs 1 resource per 5 seconds
 const BARRACK_REVIVE_COST := 1.0  # resources to regenerate one dead dot
@@ -144,9 +190,19 @@ var _team_resources: Array[float] = []
 ## so each team's production starts at its own first free slot; the base
 ## is computed in _create_buffers once the army size is known.
 var _next_free_slot: Array[int] = []
+## Highest boid id barrack production may fill. The last MINER_COUNT slots
+## are reserved for the special center miners and never receive normal
+## army production (set in _create_buffers).
+var _army_slot_cap: int = 0
 ## Seconds until each mine collapses: Vector2i(cell) -> float
 var _mine_timers: Dictionary = {}
 var _econ_timer := 0.0
+## Special center mine + its miners (set up by setup_special_mine).
+var _special_mine_cell := Vector2i(-1, -1)
+var _special_mine_world := Vector2.ZERO
+var _special_mine_hex_id := -1
+var _miner_ids: PackedInt32Array = PackedInt32Array()
+var _miner_respawn_timer := 0.0
 ## Set by main_screen.gd (or a demo harness) to learn when a mine's ground
 ## tile is destroyed, so meshes/terrain can react.
 signal mine_collapsed(cell: Vector2i, world_pos: Vector2)
@@ -157,6 +213,11 @@ signal mine_owner_changed(cell: Vector2i, world_pos: Vector2, team: int)
 ## Emitted once per economy tick with a copy of the per-team resource pools
 ## (index = team id) so UIs (the phone) can display them.
 signal resources_changed(resources: Array)
+## Emitted each frame for every fresh death explosion the CPU reads back off
+## the GPU (read_explosions). pos is the blast's world position, team is the
+## exploding dot's owner (colorize VFX by it), age is seconds since the blast
+## (0.0 on the frame it lands, within BLAST_TTL afterwards).
+signal explosion_occurred(pos: Vector3, team: int, age: float)
 
 
 func _ready() -> void:
@@ -183,10 +244,11 @@ func _ready() -> void:
 			anc = anc.get_parent()
 	if ms != null and "dots_per_team" in ms:
 		set_dot_count_per_team(int(ms.dots_per_team))
-	if ms != null:
-		var sock := ms.get_node_or_null("Socket")
-		if sock != null and "max_teams" in sock:
-			set_num_teams(int(sock.max_teams) + 1)  # + the reserved NPC slot
+	# num_teams is NOT read from the socket: it is the SOURCE OF TRUTH for
+	# the whole run (buffer layouts, team coloring, seeding all key off it
+	# and it is frozen once _create_buffers runs). The socket follows the
+	# sim instead - main_screen.gd hands phones team ids 0..num_teams-2 -
+	# so editing num_teams here is all it takes to change the team count.
 
 	# Upper bound: we never need more slots than the multimesh can hold.
 	# Both teams get the same count, so the total must fit in the pool.
@@ -312,10 +374,11 @@ func _create_buffers() -> void:
 	# Cell info: TWO uints per grid cell (hex id + packed building info),
 	# replicated across all 4 team slices. Building field layout must match
 	# sim.glsl's CellInfo:
-	#   bits  0-7 : building id (0 = none? no - 0 = castle; 255 = none)
+	#   bits  0-7 : building id
 	#   bits  8-15: owning team
-	#   bits 16-23: sub_q + 3
-	#   bits 24-31: sub_r + 3
+	#   bit  31   : BUILT flag
+	# (bits 16-30 hold the GPU build-progress counter - never written by CPU
+	# except as zero.)
 	var cell_hexes := PackedInt32Array()
 	cell_hexes.resize(table_size * 2)  # [hex_id, building] pairs
 	var building_none := 0xFF  # "no building" sentinel
@@ -499,6 +562,14 @@ func _create_buffers() -> void:
 	# std430: 128*16 + 4 for count, padded to 16 = 2064 bytes.
 	explode_buf_rid = rd.storage_buffer_create(EXPLODE_SLOTS * 16 + 16)
 
+	# Heightfield placeholder: 4-float header (map_w, map_h, height_scale,
+	# pad) all zero - sim.glsl's terrain_height() sees map_w < 1.0 and falls
+	# back to the flat world floor until set_heightmap() uploads the real
+	# terrain. std430 keeps the 16-byte buffer at exactly 16 bytes.
+	var zero_bytes := PackedByteArray()
+	zero_bytes.resize(16)  # zero-filled 4-float header
+	heightmap_rid = rd.storage_buffer_create(16, zero_bytes)
+
 	# Player teams start with a pool that scales with their army size; the
 	# reserved NPC horde slot starts broke and stays broke: no mines pay it
 	# (it never owns mines), no income, no revivals.
@@ -511,6 +582,13 @@ func _create_buffers() -> void:
 	var army_end := _dots_per_team * (num_teams - 1)
 	for t in range(num_teams):
 		_next_free_slot[t] = army_end
+
+	# Reserve the last MINER_COUNT boid slots for the special center miners.
+	# They stay dead/unrendered until setup_special_mine() activates them,
+	# so the seed loop above (live_count = army size) never touches them.
+	_army_slot_cap = instance_count - MINER_COUNT
+	for k in range(MINER_COUNT):
+		_miner_ids.append(instance_count - 1 - k)
 
 	# Clear the starve flags buffer at startup so boids aren't starving before
 	# the first economy tick.
@@ -527,6 +605,14 @@ func _make_uniform(binding: int, rid: RID) -> RDUniform:
 	u.binding = binding
 	u.add_id(rid)
 	return u
+
+
+## Storage-buffer uniform for the sim's optional bindings (e.g. binding 12,
+## the heightmap). A null/invalid RID binds the placeholder buffer instead so
+## the uniform set never has a hole and the shader's map_w == 0 fallback
+## kicks in.
+func _sim_uniform(binding: int, rid: RID) -> RDUniform:
+	return _make_uniform(binding, rid if rid.is_valid() else heightmap_rid)
 
 
 func _build_uniform_sets() -> void:
@@ -548,6 +634,8 @@ func _build_uniform_sets() -> void:
 
 		# sim.glsl: binding0=read_state,1=write_state,2=cell_offset,3=cell_count,4=sorted_idx
 		# 5=cell_info,6=global_paths,7=dmg_write(this frame),8=dmg_read(last frame)
+		# 9=econ_res,10=collapse,11=death explosions,12=terrain heightmap.
+		# Binding 12 always gets a buffer (placeholder until set_heightmap			# uploads the real image - the shader sees map_w == 0 then).
 		uniform_sets_sim.append(rd.uniform_set_create(
 			[
 				_make_uniform(0, state_buffers[parity]),
@@ -562,6 +650,7 @@ func _build_uniform_sets() -> void:
 				_make_uniform(9, econ_res_rid),         # starve flags (CPU-managed)
 				_make_uniform(10, collapse_rid),        # collapsed-tile flags
 				_make_uniform(11, explode_buf_rid),     # death-explosion ring buffer
+				_sim_uniform(12, heightmap_rid),        # terrain heightfield
 			],
 			shader_rids["sim"], 0
 		))
@@ -582,13 +671,14 @@ func _build_uniform_sets() -> void:
 func _build_push_constants(delta: float) -> PackedByteArray:
 	# Must match the GLSL struct exactly, in all 5 shaders:
 	# vec4 params      (dt, instance_count, cell_size, elapsed sim seconds)
-	# vec4 world_min   (x, y, z, unused)
+	# vec4 world_min   (x, y, z, height_scale - sim.glsl's terrain_height
+	#                   reads it from here; hex_params.w must stay hex_min_r)
 	# ivec4 grid_dims  (x, y, z, unused)
 	# vec4 hex_params  (hex_size, mesh_scale, min_q, min_r)
-	# ivec4 hex_grid   (grid_width, grid_depth, hex_width, -)
+	# ivec4 hex_grid   (grid_width, grid_depth, hex_width, desertion rate bits)
 	var floats := PackedFloat32Array([
 		delta, float(instance_count), CELL_SIZE, _elapsed_seconds,
-		WORLD_MIN.x, WORLD_MIN.y, WORLD_MIN.z, 0.0,
+		WORLD_MIN.x, WORLD_MIN.y, WORLD_MIN.z, terrain_height_scale,
 	])
 	var bytes := floats.to_byte_array()
 
@@ -627,6 +717,8 @@ func _process(delta: float) -> void:
 	rd.buffer_clear(dmg_buffers[write_i], 0, instance_count * 4)
 
 	var push_bytes := _build_push_constants(delta)
+	# Special miners: respawn dead guards on a timer (cheap CPU check).
+	_update_miners(delta)
 
 	var cl = rd.compute_list_begin()
 
@@ -662,6 +754,12 @@ func _process(delta: float) -> void:
 	rd.compute_list_end()
 	frame_parity = write_i
 
+	# Post-dispatch CPU readback: picks up blasts detonated THIS frame by
+	# the sim (see read_explosions). GPU results are not guaranteed visible
+	# to buffer_get_data until the compute list ends, so this must stay
+	# after compute_list_end().
+	read_explosions()
+
 
 func _exit_tree() -> void:
 	if not rd:
@@ -670,6 +768,14 @@ func _exit_tree() -> void:
 		rd.free_rid(pipeline_rids[name])
 	for name in shader_rids:
 		rd.free_rid(shader_rids[name])
+	# Uniform sets FIRST: freeing a buffer auto-frees the uniform sets bound
+	# to it (RenderingDevice dependency tracking), so freeing the buffers
+	# before the sets would make every set free below hit an invalid ID.
+	for rid in uniform_sets_count: rd.free_rid(rid)
+	for rid in uniform_sets_scatter: rd.free_rid(rid)
+	for rid in uniform_sets_sim: rd.free_rid(rid)
+	for rid in uniform_sets_render: rd.free_rid(rid)
+	rd.free_rid(uniform_set_prefixsum)
 	for rid in state_buffers:
 		rd.free_rid(rid)
 	rd.free_rid(cell_count_rid)
@@ -680,13 +786,14 @@ func _exit_tree() -> void:
 	rd.free_rid(econ_res_rid)
 	rd.free_rid(econ_stats_rid)
 	rd.free_rid(collapse_rid)
+	rd.free_rid(explode_buf_rid)
+	if heightmap_rid.is_valid():
+		rd.free_rid(heightmap_rid)
+	for rid in _heightmap_retired:
+		if rid.is_valid():
+			rd.free_rid(rid)
 	for rid in dmg_buffers:
 		rd.free_rid(rid)
-	for rid in uniform_sets_count: rd.free_rid(rid)
-	for rid in uniform_sets_scatter: rd.free_rid(rid)
-	for rid in uniform_sets_sim: rd.free_rid(rid)
-	for rid in uniform_sets_render: rd.free_rid(rid)
-	rd.free_rid(uniform_set_prefixsum)
 
 
 ## Returns the offset hex coordinates Vector2i(col, row) for a given 2D
@@ -747,17 +854,16 @@ var _hex_path_counts: Dictionary = {}
 ## building_id 0 = castle, 1 = tower, 2 = wall; pass -1 to clear.
 ## `built`: false = construction site (boids will march there and build it).
 ## Layout must match sim.glsl's CellInfo comments - bit 31 is the BUILT flag.
+## Whole-hex granularity: there are no sub-hex coordinates anymore (bits
+## 16-30 are the GPU build-progress counter and must start at zero).
 const BUILDING_BUILT_FLAG := 0x80000000
 
-func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: int, sub_r: int, built: bool = true) -> void:
+func set_cell_building(world_pos: Vector2, building_id: int, team: int, built: bool = true) -> void:
 	var packed: int
 	if building_id < 0:
 		packed = 0xFF  # "none"
 	else:
-		packed = (building_id & 0xFF) \
-				| ((team & 0xFF) << 8) \
-				| ((clampi(sub_q, -3, 4) + 3 & 0xFF) << 16) \
-					| ((clampi(sub_r, -3, 4) + 3 & 0x7F) << 24)
+		packed = (building_id & 0xFF) | ((team & 0xFF) << 8)
 	if built:
 		packed |= BUILDING_BUILT_FLAG
 
@@ -842,6 +948,195 @@ func set_cell_building(world_pos: Vector2, building_id: int, team: int, sub_q: i
 		_building_sites.erase(Vector2i(cx, cz))
 		_active_mines.erase(Vector2i(cx, cz))
 
+
+## Removes a player-placed BARRACK at world_pos (XZ): clears the GPU
+## building word, forgets the site, and reports success. Everything else
+## refuses - mines are the frontier economy (they die by collapse, not by
+## deletion) and walls are the map itself. Production stops naturally:
+## the economy tick only revives/produces while a team owns a barrack.
+## Returns true if a barrack was actually removed.
+func remove_building_at(world_pos: Vector2) -> bool:
+	var cx := int(floor((world_pos.x - WORLD_MIN.x) / CELL_SIZE))
+	var cz := int(floor((world_pos.y - WORLD_MIN.z) / CELL_SIZE))
+	var key := Vector2i(cx, cz)
+	if not _building_sites.has(key):
+		return false
+	# Barracks only (id 0). The packed site word carries the building id.
+	if (_building_sites[key].get("packed", 0xFF) & 0xFF) != 0:
+		return false
+	_building_sites.erase(key)
+		# Clear the building word in every team slice (barracks occupy exactly
+	# their center cell - only walls fan out over multiple cells).
+	var xz := grid_dims.x * grid_dims.z
+	var buf := PackedByteArray()
+	buf.resize(4)
+	buf.encode_u32(0, 0xFF)  # "no building"
+	for t in range(num_teams):
+		var byte_off := (t * xz + cz * grid_dims.x + cx) * 8 + 4
+		rd.buffer_update(cell_info_rid, byte_off, 4, buf)
+	return true
+
+## Uploads the terrain heightmap the dots' ground clamp samples on the GPU.
+## img: the same Image HexTile._sample_height ran on (the main screen's
+## NoiseTexture2D RED channel); height_scale: its exported scale.
+##
+## Layout (must match sim.glsl's HeightmapBuf): 4-float header -
+##   [0] map_w, [1] map_h, [2] height_scale, [3] pad
+## then row-major RED samples (w * h, x fastest), NATIVE image resolution.
+## The shader maps world XZ to texels with u = x / mesh_scale,
+## v = z / mesh_scale, fx = u + map_w * 0.5, fz = v + map_h * 0.5 - exactly
+## HexTile._sample_height's centered mapping (image texel (0,0) is the map
+## corner at (-half_width, -half_depth) in mesh_scale units) - and expands
+## with `r * 4.0 * height_scale`. Out-of-map coordinates clamp to the edge
+## texel on both CPU and GPU.
+##
+## Safe to call again at any time (e.g. re-generated terrain): the old buffer
+## is RETIRED (not freed) and the new one becomes heightmap_rid; the next
+## rebuild_sim_uniform_sets() (or _exit_tree) frees the retired buffers only
+## AFTER the uniform sets that referenced them are gone. Freeing the buffer
+## here would instantly invalidate the sim uniform sets still bound to it
+## (RenderingDevice dependency tracking), and the rebuild would then crash
+## on "Attempted to free invalid ID".
+func set_heightmap(img: Image, height_scale: float = 10.0) -> void:
+	if rd == null:
+		push_warning("set_heightmap: sim not started (rd == null) - ignored.")
+		return
+	if img == null:
+		return
+	var w := img.get_width()
+	var h := img.get_height()
+	if w <= 0 or h <= 0:
+		return
+	# Native resolution upload - no resampling, no square padding. Texel
+	# (0,0) is the map corner at (-half_width, -half_depth) in mesh_scale
+	# units, matching the mesh sampler (see the layout comment above).
+	var data := PackedFloat32Array()
+	data.resize(4 + w * h)
+	data[0] = float(w)
+	data[1] = float(h)
+	data[2] = height_scale
+	data[3] = 0.0
+	# Raw byte decode of the red channel (RGBA8/L8 fast paths, generic
+	# get_pixel fallback otherwise) - one get_data() instead of millions of
+	# marshaled get_pixel calls, which visibly stalled startup.
+	var fmt := img.get_format()
+	var bytes := img.get_data()
+	if fmt == Image.FORMAT_RGBA8:
+		for i in w * h:
+			data[4 + i] = float(bytes[i * 4]) / 255.0
+	elif fmt == Image.FORMAT_L8:
+		for i in w * h:
+			data[4 + i] = float(bytes[i]) / 255.0
+	else:
+		for y in range(h):
+			for x in range(w):
+				data[4 + y * w + x] = img.get_pixel(x, y).r
+	var new_rid := rd.storage_buffer_create(data.size() * 4, data.to_byte_array())
+	# Retire - do NOT free here: the sim uniform sets still bind this rid and
+	# freeing it would invalidate them (see the doc comment above).
+	if heightmap_rid.is_valid():
+		_heightmap_retired.append(heightmap_rid)
+	heightmap_rid = new_rid
+	heightmap_width = w
+	heightmap_depth = h
+	terrain_height_scale = height_scale
+	_heightmap_cpu = data  # cache for get_ground_height()
+	print("Heightmap uploaded: %dx%d samples (native res), height_scale %.1f" % [w, h, height_scale])
+
+## Rebuilds every uniform set so the sim sets bind the CURRENT heightmap
+## rid. Needed right after set_heightmap() swaps the buffer when you want
+## the new terrain sampled immediately (otherwise the swap lands naturally
+## within one frame's ping-pong). Frees and rebuilds ALL sets - the builder
+## only appends, so clearing just the sim arrays would leave stale
+## count/scatter/render sets shadowing the fresh ones at the ping-pong
+## indices _process indexes with.
+func rebuild_sim_uniform_sets() -> void:
+	if rd == null or not shader_rids.has("sim"):
+		return
+	for rid in uniform_sets_count: rd.free_rid(rid)
+	for rid in uniform_sets_scatter: rd.free_rid(rid)
+	for rid in uniform_sets_sim: rd.free_rid(rid)
+	for rid in uniform_sets_render: rd.free_rid(rid)
+	if uniform_set_prefixsum.is_valid():
+		rd.free_rid(uniform_set_prefixsum)
+	uniform_sets_count.clear()
+	uniform_sets_scatter.clear()
+	uniform_sets_sim.clear()
+	uniform_sets_render.clear()
+	# Sets are gone - only NOW is it safe to free the heightmap buffers they
+	# referenced (see set_heightmap's retirement comment).
+	for rid in _heightmap_retired:
+		if rid.is_valid():
+			rd.free_rid(rid)
+	_heightmap_retired.clear()
+	_build_uniform_sets()
+
+## CPU-side twin of sim.glsl's terrain_height(): the terrain surface Y at a
+## world XZ position. World coordinates convert to heightmap texels with
+## u = x / mesh_scale, v = z / mesh_scale, fx = u + width * 0.5,
+## fz = v + depth * 0.5 - exactly HexTile._sample_height's centered mapping
+## (the shader does the same) - then bilinear over the uploaded samples with
+## HexTile's `r * 4.0 * height_scale` expansion. Returns the flat world
+## floor before any upload - same fallback as the shader. Reads the cached
+## CPU copy, so it's cheap enough to call per revived dot.
+func get_ground_height(x: float, z: float) -> float:
+	if heightmap_width <= 1 or heightmap_depth <= 1 \
+			or _heightmap_cpu.size() < 4 + heightmap_width * heightmap_depth:
+		return WORLD_MIN.y
+	var mw := float(heightmap_width)
+	var mh := float(heightmap_depth)
+	var u := x / mesh_scale
+	var v := z / mesh_scale
+	var fx := clampf(u + mw * 0.5, 0.0, mw - 1.0)
+	var fz := clampf(v + mh * 0.5, 0.0, mh - 1.0)
+	var x0 := int(floor(fx))
+	var z0 := int(floor(fz))
+	var x1 := mini(x0 + 1, heightmap_width - 1)
+	var z1 := mini(z0 + 1, heightmap_depth - 1)
+	var tx := fx - float(x0)
+	var tz := fz - float(z0)
+	var hs := _heightmap_cpu[2]
+	var c00 := _heightmap_cpu[4 + z0 * heightmap_width + x0]
+	var c10 := _heightmap_cpu[4 + z0 * heightmap_width + x1]
+	var c01 := _heightmap_cpu[4 + z1 * heightmap_width + x0]
+	var c11 := _heightmap_cpu[4 + z1 * heightmap_width + x1]
+	var top := lerpf(c00, c10, tx)
+	var bottom := lerpf(c01, c11, tx)
+	return lerpf(top, bottom, tz) * 4.0 * hs
+
+
+## CPU readback of the GPU death-explosion buffer (sim.glsl binding 11):
+## EXPLODE_SLOTS vec4 slots, xyz = blast world position, w = packed
+## team<<24 | sim-time-of-blast * 256 (see the DETONATE write in sim.glsl).
+## Called once per frame from _process AFTER the compute dispatch, so it
+## sees this frame's detonations. Emits explosion_occurred for every blast
+## detonated since the previous call (one signal per blast, ever).
+## Reading the whole 2 KB list is nothing; there is no need for a count or
+## a clear - timestamp filtering does all the work.
+func read_explosions() -> void:
+	var now := floorf(_elapsed_seconds * 256.0)
+	var data := rd.buffer_get_data(explode_buf_rid, 0, EXPLODE_SLOTS * 16)
+	if data.size() < EXPLODE_SLOTS * 16:
+		return
+	var prev_read := _last_blast_read_time
+	_last_blast_read_time = now
+	for s in EXPLODE_SLOTS:
+		var off := s * 16
+		var w := data.decode_s32(off + 12) & 0xFFFFFFFF  # treat as unsigned u32
+		var blast_time := float(w & 0x00FFFFFF)
+		# Fresh blast = detonated after our previous read (age 0 this frame)
+		# or still within BLAST_TTL from a slot we never saw (age > 0).
+		if blast_time <= prev_read or blast_time > now:
+			continue
+		var pos := Vector3(
+			data.decode_float(off),
+			data.decode_float(off + 4),
+			data.decode_float(off + 8)
+		)
+		var team := (w >> 24) & 0xFF
+		explosion_occurred.emit(pos, team, max(0.0, _elapsed_seconds - blast_time / 256.0))
+
+
 ## Bulk-writes terrain wall hexes into the cell_info buffer: ONE read + ONE
 ## full-buffer update per call instead of thousands of tiny buffer_update
 ## calls (which stalled startup for ~800 wall tiles × team slices).
@@ -907,6 +1202,7 @@ func _economy_tick() -> void:
 	# countdown. Ownership is read LIVE from the GPU each tick so captures
 	# are credited the same second they happen (the old code paid a cached
 	# placement-time owner that never changed).
+	var _special_owner := -1  # set in the loop below when the special mine pays out
 	for cell in _active_mines.keys():
 		var mine: Dictionary = _active_mines[cell]
 		# Live packed building word: team-0 slice, +4 skips the hex_id word.
@@ -926,6 +1222,12 @@ func _economy_tick() -> void:
 			mine.life = MINE_LIFETIME
 			mine_owner_changed.emit(cell, mine.world, owner)
 		income[clampi(owner, 0, num_teams - 1)] += MINE_INCOME
+		if cell == _special_mine_cell:
+			# The special center mine: permanent (no lifetime countdown), and
+			# its owner earns SPECIAL_MINE_BONUS per LIVING miner on top of the
+			# normal income - 7 miners = 3x a regular mine (150/s total).
+			_special_owner = owner
+			continue
 		var life: float = mine.get("life", MINE_LIFETIME) - 1.0
 		mine.life = life
 		if life <= 0.0:
@@ -939,6 +1241,16 @@ func _economy_tick() -> void:
 			# so their pool never goes into debt and never starves.
 			upkeep[t] = 0.0 if t == num_teams - 1 \
 				else float(stats.decode_u32(t * 2 * 4)) * UPKEEP_PER_SEC
+
+	# SPECIAL MINE: pay the per-living-miner bonus to its owner. Added to
+	# income[] BEFORE the apply loop so the same tick's pool update and
+	# deficit math see it. Full crew of 7 = 3x a regular mine (150/s total).
+	if _special_mine_cell.x >= 0 and _special_owner >= 0:
+		var living := 0
+		for mid in _miner_ids:
+			if mid >= 0 and _is_boid_alive(mid):
+				living += 1
+		income[clampi(_special_owner, 0, num_teams - 1)] += float(living) * SPECIAL_MINE_BONUS
 
 	# --- apply, set starve flags + deficits, revive via barracks ---
 	# Layout MUST match sim.glsl's econ_res reads: [t*3+1] = starve flag,
@@ -989,7 +1301,7 @@ func _economy_tick() -> void:
 			continue  # no barrack: nothing can spawn for this team
 		var prod: int = barracks[t] * BARRACK_PROD_RATE
 		while prod > 0 and _team_resources[t] >= BARRACK_REVIVE_COST \
-				and _next_free_slot[t] < instance_count:
+				and _next_free_slot[t] < _army_slot_cap:
 			_team_resources[t] -= BARRACK_REVIVE_COST
 			# _revive_boid spawns into the given slot at the team's first
 			# barrack; production slots (>= army size) were never alive, so
@@ -1068,7 +1380,7 @@ func _revive_boid(team: int, boid_id: int) -> void:
 	var row := PackedFloat32Array()
 	row.resize(floats_per_boid)
 	row[0] = barrack_pos.x + randf_range(-2.0, 2.0)
-	row[1] = WORLD_MIN.y + 2.0
+	row[1] = get_ground_height(row[0], row[2])
 	row[2] = barrack_pos.y + randf_range(-2.0, 2.0)
 	row[3] = 0.0
 	# vel = 0
@@ -1098,6 +1410,86 @@ func _revive_boid(team: int, boid_id: int) -> void:
 	var byte_offset := boid_id * floats_per_boid * 4
 	for sbuf in state_buffers:
 		rd.buffer_update(sbuf, byte_offset, buf.size(), buf)
+
+## Cheap CPU-side liveness probe for one boid slot (reads just the health
+## word, 4 bytes). Used for the special miners.
+func _is_boid_alive(boid_id: int) -> bool:
+	if boid_id < 0 or boid_id >= instance_count:
+		return false
+	var data := rd.buffer_get_data(state_buffers[frame_parity], boid_id * 64 + 48, 4)
+	return data.size() == 4 and data.decode_u32(0) > 0
+
+## Activates the special center mine + its MINER_COUNT guardian dots. The
+## mine is a normal neutral built mine (existing capture rules) except:
+##   - its lifetime never counts down (permanent, never collapses),
+##   - its owner earns SPECIAL_MINE_BONUS per living miner (3x at full crew),
+##   - its hexagon hosts the miners, who never leave it (STATE_MINER).
+## Call AFTER set_terrain_walls() (the mine word overwrites the center).
+func setup_special_mine(world_pos: Vector2) -> void:
+	if rd == null:
+		return
+	# The mine: neutral (team 0xFF), already built. Active mines live in
+	# _active_mines; the special one is excluded from the lifetime countdown
+	# in _economy_tick and pays the per-miner bonus instead.
+	set_cell_building(world_pos, 1, 0xFF, true)
+	var c := world_to_hex(world_pos)
+	_special_mine_cell = Vector2i(int(floor((world_pos.x - WORLD_MIN.x) / CELL_SIZE)), \
+		int(floor((world_pos.y - WORLD_MIN.z) / CELL_SIZE)))
+	_special_mine_world = world_pos
+	_special_mine_hex_id = hex_to_id(c.x, c.y)
+	# The 7 miners: NPC-team dots with STATE_MINER, packed around the mine.
+	for k in range(MINER_COUNT):
+		# Spread the crew from mid-ring to near the rim (ring 0.35 .. 1.0).
+		_spawn_miner(_miner_ids[k], 0.35 + 0.65 * float(k) / float(MINER_COUNT - 1))
+	_miner_respawn_timer = MINER_RESPAWN_INTERVAL
+
+## Seeds one miner boid slot: NPC team, STATE_MINER, positioned on a ring
+## around the mine's hex center. `ring` 0..1 controls how close to the
+## center it spawns (0 = center, 1 = near the hex rim).
+func _spawn_miner(boid_id: int, ring: float) -> void:
+	if boid_id < 0 or boid_id >= instance_count:
+		return
+	var floats_per_boid := 16
+	var row := PackedFloat32Array()
+	row.resize(floats_per_boid)
+	var ang := TAU * float(boid_id % 7) / 7.0 + 0.45
+	var pos_x := _special_mine_world.x + cos(ang) * (hex_size * mesh_scale * 0.55) * ring
+	var pos_z := _special_mine_world.y + sin(ang) * (hex_size * mesh_scale * 0.55) * ring
+	row[0] = pos_x
+	row[1] = get_ground_height(pos_x, pos_z)
+	row[2] = pos_z
+	row[3] = 0.0
+	row[4] = 0.0; row[5] = 0.0; row[6] = 0.0; row[7] = 0.0
+	row[8] = STATE_MINER_FLAG  # state: miner
+	var np := PackedByteArray(); np.resize(4); np.encode_u32(0, 0xFFFFFFFF)
+	row[9] = np.decode_float(0)  # no path
+	row[10] = 0.0                # slot
+	var tb := PackedByteArray(); tb.resize(4); tb.encode_u32(0, num_teams - 1)
+	row[11] = tb.decode_float(0)  # NPC team: no upkeep/desertion/capture
+	var hp := PackedByteArray(); hp.resize(4); hp.encode_u32(0, MINER_HEALTH)
+	row[12] = hp.decode_float(0)
+	var hh := PackedByteArray(); hh.resize(4); hh.encode_s32(0, _special_mine_hex_id)
+	row[13] = hh.decode_float(0)  # home = the mine's hex
+	var buf := row.to_byte_array()
+	var byte_offset := boid_id * floats_per_boid * 4
+	for sbuf in state_buffers:
+		rd.buffer_update(sbuf, byte_offset, buf.size(), buf)
+
+## Called from _process: respawns dead miners at the mine on a timer.
+func _update_miners(delta: float) -> void:
+	if _special_mine_cell.x < 0 or _miner_ids.size() == 0:
+		return
+	_miner_respawn_timer -= delta
+	if _miner_respawn_timer > 0.0:
+		return
+	_miner_respawn_timer = MINER_RESPAWN_INTERVAL
+	for k in range(_miner_ids.size()):
+		var mid: int = _miner_ids[k]
+		if not _is_boid_alive(mid):
+			# dead: respawn on the ring at the same angle
+			_spawn_miner(mid, 0.65 + 0.35 * float(k) / 6.0)
+	# (living miners are left untouched)
+
 
 ## Depletes a mine: clears the building from cell_info, flags the tile
 ## collapsed (boids on it fall and die in sim.glsl), frees the site record.
@@ -1308,7 +1700,10 @@ func get_hex_center(col: int, row: int) -> Vector3:
 	var wx := (u - total_width * 0.5) * mesh_scale
 	var wz := (v - total_depth * 0.5) * mesh_scale
 
-	return Vector3(wx, WORLD_MIN.y, wz)
+	# Terrain height at the center, not the flat world floor: callers
+	# (miner placement, mine setup) need world positions ON the visible
+	# terrain, matching the dots' own ground clamp (get_ground_height).
+	return Vector3(wx, get_ground_height(wx, wz), wz)
 
 ## Computes the four corner base rectangles for the ACTUAL grid, so every
 ## team always spawns in a real corner regardless of grid_width/grid_depth.

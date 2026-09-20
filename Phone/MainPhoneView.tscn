@@ -20,7 +20,6 @@ sources/0 = SubResource("TileSetAtlasSource_c0q0t")
 script = ExtResource("1_fltoy")
 socket_path = NodePath("Socket")
 tile_map_layer = NodePath("TileMapLayer")
-connection_line_width = 4.0
 
 [node name="Socket" type="Node2D" parent="." unique_id=1758013586]
 script = ExtResource("2_341op")

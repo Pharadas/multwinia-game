@@ -3,9 +3,8 @@ class_name HexTerrainSocket
 
 ## Lives next to hex_terrain.gd (same instance/process as the 3D terrain).
 ## Runs a TCP server ANY NUMBER of phone (HexGrid2DSocket) clients connect
-## to. Each phone gets the terrain when it asks for it, and any "new_road"
-## a phone sends is applied to the 3D terrain - it is NOT rebroadcast to
-## other phones, since each phone should only ever see its own roads.
+## to. Each phone gets the terrain when it asks for it, and a phone's
+## drawn paths / building placements are applied to the 3D sim.
 ##
 ## LAN DISCOVERY: phones don't know this machine's IP address ahead of
 ## time, so alongside the TCP server this also runs a tiny UDP "is anyone
@@ -20,7 +19,8 @@ class_name HexTerrainSocket
 ##   <- in:  {"type": "request_terrain"} - a phone asking for current terrain
 ##   -> out: {"type": "terrain", "tiles": [{"col", "row", "color"}, ...]}
 ##   <- in:  {"type": "tile_clicked", "col": int, "row": int}
-##   <- in:  {"type": "new_road", "from_cell": Vector2i, "to_cell": Vector2i}
+##   <- in:  {"type": "drawn_path", "points": Array, "team": int, ...}
+##   <- in:  {"type": "building_placed", "col": int, "row": int, ...}
 ## UDP discovery messages are plain ASCII strings, not Variants, since they
 ## need to be understood before any Godot-specific handshake happens:
 ##   <- in:  "HEX_TERRAIN_DISCOVER"
@@ -31,12 +31,13 @@ class_name HexTerrainSocket
 @export var port: int = 4242
 
 ## Highest number of simultaneous teams/phones this supports - team numbers
-## handed out by _assign_team() are always in range(max_teams). Must match
-## the 4 corner bases main_screen.gd's _compute_team_bases() builds.
+## handed out by _assign_team() are always in range(max_teams).
 ## How many teams get handed out to phones. Team ids run 0..max_teams-1.
 ## NOTE: the GPU sim reserves one extra slot ABOVE these as the NPC horde
-## (deserters) - a phone is never that team. The sim must run with
-## num_teams = max_teams + 1 for the horde to exist.
+## (deserters) - a phone is never that team. The sim runs with
+## num_teams = max_teams + 1, and the sim's num_teams (stupid_simple.gd)
+## is the source of truth: main_screen.gd syncs this export to it at
+## startup, so changing the team count means editing the sim, not this.
 @export var max_teams: int = 4
 
 ## Port the UDP discovery responder listens on. Must match every phone's
@@ -66,10 +67,6 @@ const DISCOVERY_REPLY_PREFIX := "HEX_TERRAIN_HERE:"
 ## Emitted whenever a remote phone tells us a tile was clicked, in addition
 ## to the automatic click_method_name call.
 signal tile_clicked_remote(col: int, row: int)
-
-## Emitted whenever a remote phone reports a new road, in addition to the
-## automatic terrain.set_new_road() call.
-signal new_road_remote(from_cell: Vector2i, to_cell: Vector2i)
 
 ## Emitted whenever a new phone connects and is assigned a team number.
 signal player_joined(team: int)
@@ -223,30 +220,6 @@ func _handle_message(msg, from_peer: PacketPeerStream) -> void:
 			tile_clicked_remote.emit(col, row)
 			_call_tile_function(col, row, team)
 
-		"new_road":
-			var from_cell: Vector2i = msg.from_cell
-			var to_cell: Vector2i = msg.to_cell
-			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
-			# The phone already routed this road around walls and sends the chain
-			# of hexes it passes through - apply every hop of it.
-			var path: Array = msg.get("path", [])
-			new_road_remote.emit(from_cell, to_cell, team_number)
-			_apply_new_road(from_cell, to_cell, team_number, path)
-			# Deliberately NOT rebroadcast - each phone only shows its own
-			# roads. The 3D terrain still gets every road via
-			# _apply_new_road above, regardless of which phone it came from.
-
-		"remove_road":
-			var from_cell: Vector2i = msg.from_cell
-			var to_cell: Vector2i = msg.to_cell
-			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
-			new_road_remote.emit(from_cell, to_cell, team_number)
-			_apply_remove_road(from_cell, to_cell, team_number)
-
-		"clear_roads":
-			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
-			_apply_clear_roads(team_number)
-
 		"drawn_path":
 			var points: Array = msg.points
 			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
@@ -324,23 +297,6 @@ func _call_tile_function(col: int, row: int, team: int) -> void:
 			tile.select_by_team(team)
 			previously_selected_tiles[team] = tile
 
-func _apply_new_road(from_cell: Vector2i, to_cell: Vector2i, team_number, path: Array = []) -> void:
-	var terrain := _get_terrain()
-	if terrain and terrain.has_method("set_new_road"):
-		terrain.set_new_road(from_cell, to_cell, team_number, path)
-
-func _apply_remove_road(from_cell: Vector2i, to_cell: Vector2i, team_number) -> void:
-	var terrain := _get_terrain()
-	if terrain and terrain.has_method("remove_road"):
-		print("removing road from main side")
-		terrain.remove_road(from_cell, to_cell, team_number)
-
-func _apply_clear_roads(team_number: int) -> void:
-	var terrain := _get_terrain()
-	if terrain and terrain.has_method("clear_all_roads_for_team"):
-		print("clearing all roads for team ", team_number)
-		terrain.clear_all_roads_for_team(team_number)
-
 
 ## Sends `msg` to every connected phone, optionally skipping one peer (e.g.
 ## the phone that originated the message, so it doesn't get its own echo).
@@ -365,3 +321,9 @@ func broadcast_team_resources(team: int, amount: float) -> void:
 func send_terrain(tiles: Array) -> void:
 	_last_tiles = tiles
 	_broadcast({"type": "terrain", "tiles": tiles})
+
+
+## A mine hex collapsed: tells every phone to erase that hex from its 2D
+## map and advance its mining frontier one ring inward.
+func broadcast_hex_destroyed(col: int, row: int) -> void:
+	_broadcast({"type": "hex_destroyed", "col": col, "row": row})

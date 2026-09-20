@@ -13,6 +13,7 @@ struct BoidState {
 };
 
 #define STATE_CHARGING 0x00000040u  // dying dot about to explode (matches sim.glsl)
+#define STATE_MINER 0x00000080u     // special miner: gold (matches sim.glsl)
 
 struct InstanceData {
     vec4 row1; vec4 row2; vec4 row3; vec4 color;
@@ -64,7 +65,8 @@ void main() {
     uint nt = uint((pc.grid_dims.w > 0) ? pc.grid_dims.w : 4);
     uint t = boid_team % nt;
     vec4 c;
-    if (t == nt - 1u) c = vec4(0.42, 0.38, 0.46, 1.0); // NPC horde: rogue
+    if ((state.boids[id].state & STATE_MINER) != 0u) c = vec4(1.0, 0.82, 0.25, 1.0); // special miner: gold
+    else if (t == nt - 1u) c = vec4(0.42, 0.38, 0.46, 1.0); // NPC horde: rogue
     else if (t == 0u) c = vec4(0.9, 0.2, 0.2, 1.0);    // Team 0: Red
     else if (t == 1u) c = vec4(0.2, 0.8, 0.2, 1.0);    // Team 1: Green
     else if (t == 2u) c = vec4(0.2, 0.4, 0.9, 1.0);    // Team 2: Blue

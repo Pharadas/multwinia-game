@@ -188,6 +188,46 @@ func set_dot_path(dot_id: int, path_hex_ids: PackedInt32Array,
 	)
 
 
+## Assigns the same path to EVERY dot at once via a single pair of buffer
+## writes — use this when roads change and all dots should start marching.
+## All dots in a BoidSwarm share the same team, so team_id is uniform.
+## action_state: 0 = hold, 1 = move, 2 = aggressive.
+func set_all_dot_paths(path_hex_ids: PackedInt32Array,
+		team_id: int, action_state: int) -> void:
+	if not _initialized or _freed:
+		return
+	var path_len := mini(path_hex_ids.size(), MAX_PATH_LENGTH)
+	var dot_n := _dot_count
+	var team := team_id
+	var action := action_state
+	var pth := path_hex_ids
+	RenderingServer.call_on_render_thread(func() -> void:
+		if _rd == null:
+			return
+		# Path buffer: tile the same MAX_PATH_LENGTH block for every dot.
+		var all_paths := PackedInt32Array()
+		all_paths.resize(dot_n * MAX_PATH_LENGTH)
+		all_paths.fill(-1)
+		for d in range(dot_n):
+			for i in range(path_len):
+				all_paths[d * MAX_PATH_LENGTH + i] = pth[i]
+		_rd.buffer_update(_path_rid, 0,
+				all_paths.size() * 4, all_paths.to_byte_array())
+		# State buffer: reset waypoint index, set new path_len and action.
+		# team_id is the same for every dot in a swarm, so no per-dot read needed.
+		var all_states := PackedFloat32Array()
+		all_states.resize(dot_n * 4)
+		for d in range(dot_n):
+			var base := d * 4
+			all_states[base + 0] = 0.0              # waypoint_idx reset to start
+			all_states[base + 1] = float(path_len)  # path_len
+			all_states[base + 2] = float(team)      # team_id preserved
+			all_states[base + 3] = float(action)    # action_state
+		_rd.buffer_update(_path_state_rid, 0,
+				all_states.size() * 4, all_states.to_byte_array())
+	)
+
+
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------

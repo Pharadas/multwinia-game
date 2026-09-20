@@ -342,6 +342,22 @@ func _rebake_flow() -> void:
 	var hex_pos4 := _hex_positions_to_vec4()
 	_compute.update_hex_flow(hex_pos4, _hex_adj)
 
+	# Assign road waypoints to every dot so they actually march.
+	# Concatenate all drawn roads into one ordered hex-id path (capped at
+	# MAX_PATH_LENGTH). When no roads exist, send an empty path with
+	# action=hold so dots stop rather than repeating a stale route.
+	var combined := PackedInt32Array()
+	for road_key in _roads.keys():
+		for hid: int in _roads[road_key]:
+			if combined.is_empty() or combined[-1] != hid:
+				combined.append(hid)
+			if combined.size() >= BoidCompute.MAX_PATH_LENGTH:
+				break
+		if combined.size() >= BoidCompute.MAX_PATH_LENGTH:
+			break
+	var action := 1 if combined.size() > 0 else 0
+	_compute.set_all_dot_paths(combined, team_number, action)
+
 
 ## Converts the PackedVector3Array hex positions to PackedVector4Array (w=0).
 func _hex_positions_to_vec4() -> PackedVector4Array:

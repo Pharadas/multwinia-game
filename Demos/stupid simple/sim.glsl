@@ -8,6 +8,7 @@
 #define STATE_BUILDING 0x00000010u
 #define STATE_FALLING 0x00000020u
 #define STATE_CHARGING 0x00000040u  // dying dot about to explode (fuse running)
+#define STATE_MINER 0x00000080u     // special miner: hex-locked to the center mine
 #define NO_PATH 0xFFFFFFFFu
 
 // Building ids - must match stupid_simple.gd / hex_building_manager.gd
@@ -39,8 +40,6 @@ layout(set=0, binding=4, std430) buffer SortedIdx { uint idx[]; } sorted;
 // `building` is 0xFFFFFFFF when the cell has no building, otherwise packed:
 //   bits  0-7 : building id (0 = castle, 1 = tower, 2 = wall)
 //   bits  8-15: owning team
-//   bits 16-23: sub_q + 3 (axial sub-hex coord inside the parent hex, -3..3)
-//   bits 24-30: sub_r + 3
 //   bit  31   : BUILT flag (1 = finished, 0 = site - boids must build it)
 // The building whose CENTER falls in this grid cell is the one stored here;
 // the same info is replicated across all 4 team slices.
@@ -51,8 +50,7 @@ struct CellInfo {
 layout(set=0, binding=5, std430) buffer CellInfoBuf { CellInfo cells[]; } cell_info;
 
 #define BUILDING_BUILT_BIT 0x80000000u
-// Build progress lives in the packed building word's SPARE bits (16-30 -
-// the old sub-hex fields, unused since buildings became whole-hex): a
+// Build progress lives in the packed building word's SPARE bits (16-30): a
 // 15-bit counter of builder-frames accumulated on the site. 15 bits is
 // what lets walls take 10x the work of other buildings (600 > 255, the
 // old byte-wide counter would have overflowed into neighboring fields).
@@ -65,8 +63,6 @@ layout(set=0, binding=5, std430) buffer CellInfoBuf { CellInfo cells[]; } cell_i
 
 uint cell_building_id(uint packed_info)  { return packed_info & 0xFFu; }
 uint cell_building_team(uint packed_info){ return (packed_info >> 8u) & 0xFFu; }
-int  cell_building_sub_q(uint packed_info) { return int((packed_info >> 16u) & 0xFFu) - 3; }
-int  cell_building_sub_r(uint packed_info) { return int((packed_info >> 24u) & 0x7Fu) - 3; }
 bool cell_building_is_built(uint packed_info) { return (packed_info & BUILDING_BUILT_BIT) != 0u; }
 
 // Grid-cell scan radius for building detection / capture / construction
@@ -121,26 +117,68 @@ layout(set=0, binding=10, std430) buffer CollapseBuf { uint flags[]; } collapse_
 //    everyone can see it; nearby boids read the flag and RUN AWAY.
 //
 // 2. BLAST: when the fuse hits zero the boid writes vec4(xyz = blast
-//    world pos, w = sim time of the blast) into its per-id slot and dies.
-//    NEXT frame every boid scans the slot list; any blast younger than
-//    BLAST_TTL within BLAST_RADIUS adds a strong outward impulse to its
-//    velocity - units get sent flying. The one-frame latency is what makes
-//    the impulse readable by everyone (dispatch barrier). Timestamps age
-//    out, so the list never needs clearing.
+//    world pos, w = packed team<<24 | sim-time-of-blast * 256 bits) into
+//    its per-id slot and dies. NEXT frame every boid scans the slot list; any
+//    blast younger than BLAST_TTL within BLAST_RADIUS adds a strong outward
+//    impulse to its velocity - units get sent flying. The CPU also reads
+//    this buffer every frame (read_explosions()) to spawn VFX/audio.
+//    The sim dispatch barrier makes each new blast readable by everyone.
+//    Timestamps age out, so the list never needs clearing.
 #define EXPLODE_SLOTS 128u
 #define BLAST_RADIUS 25.0
 #define BLAST_TTL 0.4
 
+// --- FORMAL MOVEMENT (Multiwinia-style) -------------------------------------
+// Units walk to a chosen point, arrive, idle, then choose again - discrete
+// decisions instead of constant boid forces. Idle dots stroll between
+// waypoints inside their own hex; builders take seats in the six hexes
+// EDGE-ADJACENT to the construction site's hex (never inside the building's
+// hex itself). Near-field separation stays on everywhere so dots never
+// overlap, but the old flocking mush (sep/align/coh) is gone.
+#define WALK_SPEED    2.2   // idle stroll + build approach (u/s)
+#define MARCH_SPEED   4.0   // speed cap while following a path
+#define WAYPOINT_MIN  3.0   // seconds per idle waypoint (min)
+#define WAYPOINT_MAX  7.0   // seconds per idle waypoint (max)
+#define ARRIVE_RADIUS 0.8   // stop distance; brake inside, hard stop near 0
+
+// Marching lane spread: each follower walks a personal lane this far off
+// the path centerline (in world units, before the per-boid hash variance),
+// alternating sides. The centerline itself stays clean-ish; the column
+// becomes a road-like crowd instead of a single-file snake. 0.0 disables.
+#define MARCH_LANE_OFFSET 2.0
+#define MARCH_LANE_JITTER 1.6   // extra per-boid variance on top of the lane
+
 // (file & rank formations replaced by nearest-segment path flow - rigid
-// slots self-jammed when hundreds of boids claimed one path)
+// slots self-jammed when hundreds of boids claimed one path; the lane
+// offsets below are loose/anchored, so they keep the flow and add width.)
 
 layout(set=0, binding=11, std430) buffer ExplodeBuf {
     vec4 data[128];   // xyz = blast position, w = sim time of the blast
     uint count;       // unused (kept for buffer layout) - scans filter by age
 } explode_buf;
 
+// TERRAIN HEIGHTFIELD (binding 12), CPU-uploaded once by set_heightmap() in
+// stupid_simple.gd from the main screen's NoiseTexture2D:
+//   [0] map_w        : image width (e.g. 512)
+//   [1] map_h        : image height (e.g. 512)
+//   [2] height_scale : main_screen.gd's height_scale export
+//   [3] pad          : alignment padding (0.0)
+//   [...]            : map_w*map_h RED-channel samples, row-major, centered
+//                      at (0,0) world coordinates.
+// terrain_height() rebuilds HexTile._sample_height's bilinear
+// `r * 4.0 * height_scale` so ground dots rest on the visible terrain.
+layout(set=0, binding=12, std430) buffer HeightmapBuf {
+    float map_w;
+    float map_h;
+    float height_scale;
+    float pad;
+    float heights[];
+} heightmap;
+
 layout(push_constant) uniform PC {
     // grid_dims.w = num_teams - every team-indexed buffer/loop keys off it.
+    // world_min.w carries the terrain height_scale (the slot was unused;
+    // hex_params.w is hex_min_r and must NOT be touched).
     vec4 params; vec4 world_min; ivec4 grid_dims;
     vec4 hex_params; ivec4 hex_grid;
 } pc;
@@ -149,6 +187,38 @@ layout(local_size_x=64) in;
 
 ivec3 get_cell(vec3 pos, vec3 world_min, float cell_size) {
     return ivec3(floor((pos - world_min) / cell_size));
+}
+
+// Terrain surface Y at a world XZ position: bilinear over the uploaded
+// heightfield, reproducing HexTile._sample_height's `r * 4.0 * height_scale`
+// (the CPU fills heights[] with the raw RED samples; the *4.0*height_scale
+// expansion happens here). World coordinates map to heightmap UV via
+// u = xz.x / mesh_scale, v = xz.y / mesh_scale, exactly matching HexTile.
+// Outside the map, coordinates clamp to the edge texel exactly like the CPU
+// sampler; before any upload (map_w < 1.0) it falls back to the flat world floor.
+float terrain_height(vec2 xz) {
+    if (heightmap.map_w < 1.0 || heightmap.map_h < 1.0 || pc.world_min.w <= 0.0) return pc.world_min.y;
+    float mesh_scale = pc.hex_params.y > 0.001 ? pc.hex_params.y : 10.0;
+    float u = xz.x / mesh_scale;
+    float v = xz.y / mesh_scale;
+    float fx = clamp(u + heightmap.map_w * 0.5, 0.0, heightmap.map_w - 1.0);
+    float fz = clamp(v + heightmap.map_h * 0.5, 0.0, heightmap.map_h - 1.0);
+    uint wi = uint(floor(fx));
+    uint wj = uint(floor(fz));
+    uint mw = uint(heightmap.map_w);
+    uint mh = uint(heightmap.map_h);
+    uint x1 = min(wi + 1u, mw - 1u);
+    uint z1 = min(wj + 1u, mh - 1u);
+    float tx = fx - float(wi);
+    float tz = fz - float(wj);
+    float c00 = heightmap.heights[wj * mw + wi];
+    float c10 = heightmap.heights[wj * mw + x1];
+    float c01 = heightmap.heights[z1 * mw + wi];
+    float c11 = heightmap.heights[z1 * mw + x1];
+    float top = mix(c00, c10, tx);
+    float bot = mix(c01, c11, tx);
+    float r = mix(top, bot, tz);
+    return r * 4.0 * pc.world_min.w;
 }
 
 uint cell_index_2d(int team, ivec3 cell, ivec3 dims) {
@@ -265,6 +335,71 @@ vec3 hex_center_from_id(int hex_id) {
     return vec3(wx, 0.0, wz);
 }
 
+// Seek with Multiwinia-style arrival: full speed outside ARRIVE_RADIUS,
+// linear brake inside, hard stop close in. Pure XZ - Y stays gravity's job.
+vec3 walk_to(vec3 pos, vec3 target) {
+    vec2 to = target.xz - pos.xz;
+    float d = length(to);
+    if (d < 0.001) return vec3(0.0);
+    float speed = WALK_SPEED * clamp((d - ARRIVE_RADIUS * 0.4) / (ARRIVE_RADIUS * 0.6), 0.0, 1.0);
+    if (speed <= 0.0) return vec3(0.0);
+    vec2 v = (to / d) * speed;
+    return vec3(v.x, 0.0, v.y);
+}
+
+// Stateless idle waypoint inside the home hex: changes when the boid's
+// personal waypoint epoch (period = hash(id) mapped over WAYPOINT_MIN..MAX
+// seconds) rolls over. No storage - (id, epoch) IS the state.
+vec3 idle_waypoint(int hex_id, uint id, float now) {
+    float period = WAYPOINT_MIN + hash(id * 17u + 3u) * (WAYPOINT_MAX - WAYPOINT_MIN);
+    uint epoch = uint(floor(now / period));
+    vec3 c = hex_center_from_id(hex_id);
+    float radius = pc.hex_params.x * pc.hex_params.y * 0.7;  // hex circumradius
+    float ang = hash(id * 977u + epoch * 31u) * 6.2831853;
+    float rr = sqrt(hash(id * 431u + epoch * 57u)) * radius * 0.75;
+    vec3 target = c + vec3(cos(ang) * rr, 0.0, sin(ang) * rr);
+    target.y = terrain_height(target.xz);
+    return target;
+}
+
+// Offset (col, row) deltas for the six edge-adjacent neighbor hexes -
+// EVEN-column base table (odd-q flat-top, matching world_to_hex_id /
+// hex_center_from_id's axial math). hex_neighbor_id applies the odd-column
+// parity shift on top.
+//   dir 0=N 1=S 2=E 3=W 4=NE 5=SW   (NE/SW chosen as the diagonal pair)
+const ivec2 HEX_EDGE_NEIGHBORS[6] = ivec2[6](
+    ivec2( 0, -1), ivec2( 0,  1),   // N, S      (pure rows: no parity shift)
+    ivec2( 1,  0), ivec2(-1, -1),   // E, W
+    ivec2( 1, -1), ivec2(-1,  0)    // NE, SW
+);
+
+// 1D hex id of the neighbor hex in direction `dir` (0..5) from hex_id.
+// Returns -1 when the neighbor falls outside the hex grid. Row parity shift
+// comes from floor((col+dx)/2) - floor(col/2): +1 when stepping +x out of an
+// odd column, -1 when stepping -x out of an even column, 0 otherwise.
+int hex_neighbor_id(int hex_id, int dir) {
+    int w = int(pc.hex_grid.z);
+    if (w <= 0) w = int(pc.hex_grid.x);
+    if (w <= 0 || hex_id < 0) return -1;
+    int min_q = int(pc.hex_params.z);
+    int min_r = int(pc.hex_params.w);
+    int hex_h = int(pc.hex_grid.y);
+    if (hex_h <= 0) hex_h = int(pc.hex_grid.x);
+    int col = hex_id % w + min_q;
+    int row = hex_id / w + min_r;
+    ivec2 d = HEX_EDGE_NEIGHBORS[dir];
+    int pdelta;
+    if (d.x == 0)     pdelta = 0;
+    else if (d.x > 0) pdelta = ((col & 1) != 0) ? 1 : 0;
+    else              pdelta = ((col & 1) != 0) ? 0 : -1;
+    int nrow = row + d.y + pdelta;
+    int ncol = col + d.x;
+    int nq = ncol - min_q;
+    int nr = nrow - min_r;
+    if (nq < 0 || nq >= w || nr < 0 || nr >= hex_h) return -1;
+    return nr * w + nq;
+}
+
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= uint(pc.params.y)) return;
@@ -312,6 +447,78 @@ void main() {
         return;
     }
 
+    // --- WALL RESCUE: dots must never appear inside a wall ---
+    // A dot can END UP inside a wall cell even though the wall-bounce below
+    // blocks entry: the CPU seeds/revives dots at hex centers without
+    // knowing which cells are walled (the team corner bases are mostly
+    // forced-wall tiles, and the army is seeded before the terrain exists),
+    // and a blast or shove can throw a dot across the single-cell wall check
+    // before the bounce sees it. A dot buried inside the wall prism is
+    // invisible, and the entry-only bounce can never free it.
+    //
+    // Every live dot therefore checks its OWN cell each frame: if it holds
+    // a BUILT wall (terrain walls carry team byte 255, built walls carry
+    // their owner - both block), teleport to the nearest free grid cell,
+    // expanding ring by ring, and re-home there. Runs before any steering,
+    // so a dot never simulates a frame inside the wall; the state reset
+    // drops any path/seat/combat bookkeeping that pointed into the wall.
+    // Unbuilt wall SITES are not obstacles - builders must walk inside them.
+    // The ground gate keeps blast arcs PASSING OVER a wall airborne: walls
+    // rise ~5 units, so anything above ground+6 is visibly above the prism,
+    // not buried in it (it gets caught on the way down if it would land in).
+    if (cell_building_id(cell_info.cells[cell_ci].building) == BUILDING_WALL
+        && cell_building_is_built(cell_info.cells[cell_ci].building)
+        && pos.y <= terrain_height(pos.xz) + 6.0) {
+        bool free_found = false;
+        ivec3 free_cell = my_cell;
+        for (int ring = 1; ring <= 16 && !free_found; ring++) {
+            for (int dx = -ring; dx <= ring && !free_found; dx++) {
+                for (int dz = -ring; dz <= ring && !free_found; dz++) {
+                    if (max(abs(dx), abs(dz)) != ring) continue;  // ring shell only
+                    ivec3 cc = my_cell + ivec3(dx, 0, dz);
+                    if (cc.x < 0 || cc.x >= dims.x || cc.z < 0 || cc.z >= dims.z) continue;
+                    uint pk = cell_info.cells[cell_index_2d(0, cc, dims)].building;
+                    if (cell_building_id(pk) == BUILDING_WALL && cell_building_is_built(pk)) continue;
+                    free_cell = cc;
+                    free_found = true;
+                }
+            }
+        }
+        // No free cell within 16 rings (dot fully boxed in): fall back to
+        // the map edge rather than placing at an out-of-grid cell.
+        if (!free_found) {
+            free_cell = ivec3(clamp(my_cell.x, 0, dims.x - 1), 0,
+                              clamp(my_cell.z, 0, dims.z - 1));
+        }
+        vec2 rp_xz = vec2((float(free_cell.x) + 0.5) * cell_size + pc.world_min.x,
+                          (float(free_cell.z) + 0.5) * cell_size + pc.world_min.z);
+        // Small hash spread so a stack of rescued dots doesn't pop apart.
+        float ja = hash(id * 257u + 13u) * 6.2831853;
+        rp_xz += vec2(cos(ja), sin(ja)) * (hash(id * 521u + 7u) * cell_size * 0.3);
+        // The jitter may cross into a neighboring wall's coverage - fall
+        // back to the exact free-cell center when it does.
+        int jx = clamp(int(floor((rp_xz.x - pc.world_min.x) / cell_size)), 0, dims.x - 1);
+        int jz = clamp(int(floor((rp_xz.y - pc.world_min.z) / cell_size)), 0, dims.z - 1);
+        uint jpk = cell_info.cells[cell_index_2d(0, ivec3(jx, 0, jz), dims)].building;
+        if (cell_building_id(jpk) == BUILDING_WALL && cell_building_is_built(jpk)) {
+            rp_xz = vec2((float(free_cell.x) + 0.5) * cell_size + pc.world_min.x,
+                         (float(free_cell.z) + 0.5) * cell_size + pc.world_min.z);
+        }
+        pos = vec3(rp_xz.x, terrain_height(rp_xz), rp_xz.y);
+        original_pos = pos;
+        original_hex_id = world_to_hex_id(pos);
+        home_hex = original_hex_id;
+        state = STATE_ALIVE;
+        assigned_hex = NO_PATH;
+        assigned_slot = 0u;
+        vel = vec3(0.0);
+        wall_bumps = 0u;
+        last_wall = 0u;
+        // Fresh cell/building context for everything below.
+        my_cell = get_cell(pos, pc.world_min.xyz, cell_size);
+        cell_ci = cell_index_2d(0, my_cell, dims);
+    }
+
     // --- CHARGING EARLY-OUT ---
     // A dot with a lit fuse does nothing but slide (momentum from whoever
     // shoved it), tick, and detonate. No combat, no capture, no building,
@@ -321,10 +528,24 @@ void main() {
         vel.xz *= max(0.0, 1.0 - 2.0 * pc.params.x);  // ground friction
         vel.y -= 9.8 * pc.params.x;
         pos += vel * pc.params.x;
+        // Even panicking dots don't sink into the terrain.
+        float charge_ground = terrain_height(pos.xz);
+        if (pos.y < charge_ground) {
+            pos.y = charge_ground;
+            if (vel.y < 0.0) vel.y = 0.0;
+        }
         if (pc.params.w >= float(assigned_slot)) {
             // DETONATE: timestamped blast in this boid's dedicated slot;
             // everyone scans the slot list next frame (see buffer comment).
-            explode_buf.data[id % EXPLODE_SLOTS] = vec4(pos, pc.params.w);
+            // .w carries float-bits of (team << 24 | sim-time * 256): the
+            // CPU reader decodes the owner team AND the sim timestamp from
+            // that one u32, so VFX/audio can dedupe and colorize without
+            // any extra buffer. 1/256 s resolution (24 bits) runs ~18 h
+            // before wrapping - whole-second stamps would make two blasts
+            // in the same wall-clock second indistinguishable.
+            explode_buf.data[id % EXPLODE_SLOTS] = vec4(pos,
+                uintBitsToFloat((uint(my_team) << 24)
+                    | (min(uint(pc.params.w * 256.0), 0x00FFFFFFu))));
             write_s.boids[id].pos = vec4(pos, float(my_team));
             write_s.boids[id].vel = vec4(0.0);
             write_s.boids[id].state = STATE_ALIVE;
@@ -337,7 +558,7 @@ void main() {
         }
         // Fuse still burning: stay at 1 HP so only the fuse can end it.
         write_s.boids[id].pos = vec4(pos, float(my_team));
-        write_s.boids[id].vel = vec4(vel, 0.0);
+        write_s.boids[id].vel = vec4(0.0);
         write_s.boids[id].state = state | STATE_CHARGING;
         write_s.boids[id].assigned_path_hex = NO_PATH;
         write_s.boids[id].assigned_path_slot = assigned_slot;  // the fuse
@@ -417,11 +638,8 @@ void main() {
     // flocking neighbors below we note their charge state and add a strong
     // flee force away from any CHARGING dot (runs away BEFORE the blast).
 
-    // Per-boid random offsets — each boid gets slightly different forces
-    // even when neighbors are identical, breaking grid lockstep.
-    float rx = hash(id * 3u + 0u) * 2.0 - 1.0;
-    float ry = hash(id * 3u + 1u) * 2.0 - 1.0;
-    float rz = hash(id * 3u + 2u) * 2.0 - 1.0;
+    // (Per-boid random force offsets removed with the flocking mush -
+    // waypoint/seat decisions below are themselves per-boid hashed.)
 
     vec3 sep = vec3(0.0), align = vec3(0.0), coh = vec3(0.0);
     vec3 boid_sep = vec3(0.0);  // hard near-field separation (anti-jam)
@@ -455,7 +673,8 @@ void main() {
                 // used to jam into overlapping clumps that behaved like
                 // solid obstacles for everyone behind them.
                 if (d < cell_size * 0.45) {
-                    boid_sep += (pos - other_pos) / max(d * d, 0.01);
+                    vec2 diff = pos.xz - other_pos.xz;
+                    boid_sep.xz += diff / max(dot(diff, diff), 0.01);
                 }
                 align += read_s.boids[other_id].vel.xyz;
                 coh += other_pos;
@@ -465,7 +684,9 @@ void main() {
                 // enemies flee too, this overrides the combat stand-ground
                 // below via a flag).
                 if ((read_s.boids[other_id].state & STATE_CHARGING) != 0u) {
-                    flee_dir += (pos - other_pos) / d;
+                    vec2 fd = pos.xz - other_pos.xz;
+                    float fld = length(fd);
+                    if (fld > 0.001) flee_dir.xz += fd / fld;
                     fleeing = true;
                 }
             }
@@ -473,18 +694,14 @@ void main() {
     }
 
     vec3 accel = vec3(0.0);
-    if (neighbors > 0) {
-        align /= float(neighbors);
-        coh = (coh / float(neighbors)) - pos;
-        // Separation doubled (was 4.0): converging columns need real
-        // push-back or they compress into a plug nothing can pass through.
-        accel = sep * 9.0 + align * 1.0 + coh * 1.5;
-    }
-    // Near-field separation applies even with zero flocking neighbors.
+    // FORMAL MOVEMENT: the flocking mush (sep/align/coh accumulated above)
+    // and the constant random wander shove are gone. Units now DECIDE where
+    // to walk: idle dots stroll between waypoints inside their current hex
+    // (formal idle stroll, after the construction block), builders take
+    // whole-hex seats around their site, and pathed columns march the road.
+    // Only the near-field separation force stays continuous so dots never
+    // overlap - it alone spreads crowds naturally.
     accel += boid_sep;
-
-    // Add per-boid wander force to break grid symmetry
-    accel += vec3(rx, ry * 0.3, rz) * 1.5;
 
     // NPC deserters ROAM THE MAP: a strong per-boid heading that re-rolls
     // (per boid) every ~7 s, layered on top of regular flocking. Combined
@@ -581,6 +798,7 @@ void main() {
         // Enemy in sight but out of melee: pursue it. Path assignment is
         // kept (not dropped), so combat resume picks the same path back up.
         vec3 chase_dir = closest_enemy_pos - pos;
+        chase_dir.y = 0.0;
         float clen = length(chase_dir);
         if (clen > 0.001) {
             accel += (chase_dir / clen) * 6.0;
@@ -619,6 +837,7 @@ void main() {
     // FLEE overrides everything (except the blast itself): a strong,
     // un-normalized sum so several charging dots push harder than one.
     if (fleeing) {
+        flee_dir.y = 0.0;
         accel += normalize(flee_dir) * 12.0;
         state |= STATE_FIGHTING;  // hex-free while panicking
     }
@@ -678,7 +897,10 @@ void main() {
     // detection range (4x perception) - march on it and rally at its walls.
     // Mobile enemies take priority (handled above). Boids don't deal building
     // damage yet (no building HP on the GPU).
-    if (nearby_enemies == 0 && closest_bldg_d < perception * 4.0) {
+    // NPCs never attack buildings: the sim can't see them anyway (capture and
+    // build skip deserters), so this force just drags roamers to the nearest
+    // hostile structure - most visibly the center mine - and pins them there.
+    if (!is_npc && nearby_enemies == 0 && closest_bldg_d < perception * 4.0) {
         vec3 to_bldg = closest_bldg_pos - pos;
         to_bldg.y = 0.0;
         float bd = length(to_bldg);
@@ -732,17 +954,88 @@ void main() {
         // idle boids break off to construct. With the old rule every
         // pathed boid passing within 2 cells of a site detoured into it
         // and stood there - the bulk of a marching column froze mid-way.
-        vec3 site_pos = pc.world_min.xyz + vec3(float(site_cell.x) + 0.5, 0.0, float(site_cell.z) + 0.5) * cell_size;
-        vec3 to_site = site_pos - pos;
-        to_site.y = 0.0;
-        float sd = length(to_site);
-        if (sd > 0.8) {
-            // March to the construction site (frees hexes like fighting does).
-            accel += normalize(to_site) * 6.0;
-            state |= STATE_FIGHTING;
-            fighting = true;
+        //
+        // FORMAL BUILD SURROUND: units are always in WHOLE hexes - builders
+        // take seats in the six hexes EDGE-ADJACENT to the site's hex and
+        // never step into the building hex itself. Each builder tries the
+        // seats in a hash(id)-rotated order and takes the first one nobody
+        // stands in (occupied = a living boid within 1.5u of the seat's
+        // center, sampled through the spatial grid); if all six are taken
+        // it shares its first valid seat - separation makes co-tenants
+        // stand shoulder to shoulder, reading like a proper build crowd.
+        uint site_hex = cell_info.cells[cell_index_2d(0, site_cell, dims)].hex_id;
+        int seat_hex = -1;
+        {
+            int first_valid = -1;
+            int rot = int(hash(id * 61u + 5u) * 6.0);
+            for (int k = 0; k < 6; k++) {
+                int dir = (rot + k) % 6;
+                int nh = hex_neighbor_id(int(site_hex), dir);
+                if (nh < 0) continue;                       // off the map edge
+                vec3 sc = hex_center_from_id(nh);
+                sc.y = 0.0;
+                if (first_valid < 0) first_valid = nh;
+                // Occupied? Sample living boids near the seat center.
+                bool busy = false;
+                ivec3 scell = get_cell(sc, pc.world_min.xyz, cell_size);
+                for (int t = 0; t < num_teams && !busy; t++) {
+                    for (int cxx = -1; cxx <= 1 && !busy; cxx++) {
+                        for (int czz = -1; czz <= 1 && !busy; czz++) {
+                            ivec3 tc = scell + ivec3(cxx, 0, czz);
+                            if (tc.x < 0 || tc.x >= dims.x || tc.z < 0 || tc.z >= dims.z) continue;
+                            uint h = cell_index_2d(t, tc, dims);
+                            uint cnt = cell_count.counts[h];
+                            uint st = cell_offset.offsets[h];
+                            uint samples = min(cnt, 6u);
+                            for (uint k2 = 0u; k2 < samples; k2++) {
+                                uint oi = sorted.idx[st + k2];
+                                if (oi == id) continue;
+                                if (read_s.boids[oi].health == 0u) continue;
+                                vec3 op = read_s.boids[oi].pos.xyz;
+                                if (distance(op, sc) < 1.5) { busy = true; break; }
+                            }
+                        }
+                    }
+                }
+                if (!busy) { seat_hex = nh; break; }
+            }
+            if (seat_hex < 0) seat_hex = first_valid;       // all busy: share
+        }
+        bool have_seat = seat_hex >= 0;
+        vec3 target_spot = vec3(0.0);
+        if (have_seat) {
+            target_spot = hex_center_from_id(seat_hex);
+            target_spot.y = terrain_height(target_spot.xz);
+        }
+        bool at_spot = false;
+        if (have_seat) {
+            float sd = distance(pos, target_spot);
+            if (sd > ARRIVE_RADIUS * 0.5) {
+                // Walk to the seat (hex-free while en route; the seat is a
+                // whole neighboring hex, so crossing is required by design).
+                accel += walk_to(pos, target_spot);
+                state |= STATE_FIGHTING;
+                fighting = true;
+            } else {
+                at_spot = true;
+            }
         } else {
-            // AT the site: stand still and BUILD. Progress accumulates in
+            // Map-edge fallback: no valid neighbor hex exists, so build from
+            // the site cell itself (old rule).
+            vec3 site_pos = pc.world_min.xyz + vec3(float(site_cell.x) + 0.5, 0.0, float(site_cell.z) + 0.5) * cell_size;
+            vec3 to_site = site_pos - pos;
+            to_site.y = 0.0;
+            float sd = length(to_site);
+            if (sd > 0.8) {
+                accel += normalize(to_site) * WALK_SPEED;
+                state |= STATE_FIGHTING;
+                fighting = true;
+            } else {
+                at_spot = true;
+            }
+        }
+        if (at_spot) {
+            // AT the seat: stand still and BUILD. Progress accumulates in
             // the packed building word (bits 16-30): every builder on the
             // site adds one unit per frame via atomicAdd, so crowds build
             // faster. Walls need WALL_BUILD_WORK (~10s for one builder).
@@ -773,6 +1066,64 @@ void main() {
         }
     } else {
         state &= ~STATE_BUILDING;
+    }
+
+    // --- SPECIAL MINER EARLY-OUT ---
+    // The 7 miner dots guarding the center special mine: they stroll between
+    // waypoints strictly INSIDE the mine's hex and never leave it. No combat,
+    // no paths, no capture, no building, no starvation/desertion (they're on
+    // the NPC slot, which is exempt from all of those anyway) - but ordinary
+    // melee damage still lands (consumed below), so a raid can kill through
+    // them to take the mine. Death is silent: the CPU respawns miners at the
+    // mine every few seconds. Near-field separation above still applies so
+    // they don't overlap; the stroll target is the mine hex itself, so no
+    // extra wander force is needed.
+    if ((state & STATE_MINER) != 0u) {
+        accel += walk_to(pos, idle_waypoint(original_hex_id, id, pc.params.w));
+        vel.xz += (accel.xz - vel.xz) * min(6.0 * pc.params.x, 1.0);
+        vel.y -= 9.8 * pc.params.x;
+        pos += vel * pc.params.x;
+        float miner_ground = terrain_height(pos.xz);
+        if (pos.y < miner_ground) {
+            pos.y = miner_ground;
+            if (vel.y < 0.0) vel.y = 0.0;
+        } else if (vel.y <= 0.0 && (pos.y - miner_ground) < 4.0) {
+            pos.y = miner_ground;
+            vel.y = 0.0;
+        }
+        // HARD hex lock: any step out of the mine hex snaps straight back.
+        if (world_to_hex_id(pos) != original_hex_id) {
+            pos.xz = original_pos.xz;
+            vel.xz = vec2(0.0);
+        }
+        uint miner_hp = read_s.boids[id].health;
+        uint miner_incoming = dmg_read.dmg[id];
+        if (miner_hp <= miner_incoming) miner_hp = 0u;
+        else miner_hp -= miner_incoming;
+        write_s.boids[id].pos = vec4(pos, float(my_team));
+        write_s.boids[id].vel = vec4(vel, 0.0);
+        write_s.boids[id].state = state | STATE_MINER;
+        write_s.boids[id].assigned_path_hex = NO_PATH;
+        write_s.boids[id].assigned_path_slot = 0u;
+        write_s.boids[id].team = uint(my_team);
+        write_s.boids[id].home_hex = original_hex_id;
+        write_s.boids[id].health = miner_hp;
+        return;
+    }
+
+    // FORMAL IDLE STROLL: an idle dot (no path, not fighting/building,
+    // nothing to flee) walks to its personal waypoint inside its CURRENT
+    // hex and stops there until its waypoint epoch rolls over and a new
+    // target is drawn. Hex-crossing is allowed while en route so the hex
+    // clamp doesn't fight the stroll near the edge; the target lives
+    // inside the same hex, so an arrived dot settles hex-bound on the spot.
+    if (!is_npc && !fighting && !building_now && !fleeing && !was_fighting
+            && assigned_hex == NO_PATH && nearby_enemies == 0) {
+        vec3 wp = idle_waypoint(original_hex_id, id, pc.params.w);
+        accel += walk_to(pos, wp);
+        // No hex-free flag here: the hexagon is convex and both ends of the
+        // walk live inside it, so the hard hex clamp is a free safety net
+        // (it also keeps was_fighting/combat-resume bookkeeping clean).
     }
 
     // 1. If boid has no path assigned, look at its current hex for team paths.
@@ -912,26 +1263,38 @@ void main() {
                 }
             }
 
-            float d = sqrt(best_d2);
+            // MARCHING LANES: the dot's reference point is a personal lane
+            // beside the centerline, not the line itself. Side + width are
+            // a stable hash of the boid id, so every dot keeps its lane for
+            // the whole march (no reshuffle wobble) and the column spreads
+            // into a road-width crowd instead of grinding single-file.
+            vec2 seg_dir = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[min(best_seg + 1, p_count - 1)]
+                         - global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[best_seg];
+            float sl = length(seg_dir);
+            if (sl < 0.001) seg_dir = vec2(0.0, 1.0); else seg_dir /= sl;
+            vec2 seg_nrm = vec2(-seg_dir.y, seg_dir.x);
+            float lane_side = (hash(id * 337u) < 0.5) ? -1.0 : 1.0;
+            float lane_off = lane_side * (MARCH_LANE_OFFSET + MARCH_LANE_JITTER * hash(id * 911u));
+            vec2 lane_pt = best_pt + seg_nrm * lane_off;
+
+            // Off-road test measures distance to the LANE point: a dot
+            // sitting in its lane reads as on-path (a centerline test
+            // would fight the lane forever).
+            float d = distance(pxz, lane_pt);
             if (d > 2.5) {
-                // Off the path: cut back to the nearest segment first -
-                // this makes the column FLOW along the drawn route instead
-                // of every boid cutting a straight line to the endpoint
-                // and wedging into chokepoints.
-                vec3 to_seg = vec3(best_pt.x - pxz.x, 0.0, best_pt.y - pxz.y);
-                accel += normalize(to_seg) * 8.0;
+                // Strayed (spawned wide, shoved by a blast): cut back to
+                // the personal lane - the column reforms around the route
+                // instead of every boid cutting to the endpoint and
+                // wedging into chokepoints.
+                vec3 to_lane = vec3(lane_pt.x - pxz.x, 0.0, lane_pt.y - pxz.y);
+                accel += normalize(to_lane) * 8.0;
             } else {
-                // On the path: look ahead along the route and follow the
-                // corridor. Aim point = nearest point + lookahead along
-                // the path direction; the goal-seek toward the final point
-                // keeps the column converging on the objective.
-                vec2 seg_dir = global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[min(best_seg + 1, p_count - 1)]
-                             - global_paths.hex_paths[t_hex_idx].paths[assigned_slot].points[best_seg];
-                float sl = length(seg_dir);
-                if (sl < 0.001) seg_dir = vec2(0.0, 1.0); else seg_dir /= sl;
-                vec2 aim = best_pt + seg_dir * 6.0;
-                // On the last segment, aim at the endpoint itself so the
-                // army gathers AT the objective instead of orbiting past it.
+                // On the lane: look ahead along the route, aiming at the
+                // LANE point 6 units ahead so lanes bend with the road.
+                vec2 aim = lane_pt + seg_dir * 6.0;
+                // Last segment: aim at the endpoint itself (all lanes
+                // converge) so the army gathers AT the objective instead
+                // of orbiting past it.
                 if (best_seg >= p_count - 2) aim = final_pt;
                 vec2 to_aim = aim - pxz;
                 if (length(to_aim) > 0.5) {
@@ -955,7 +1318,7 @@ void main() {
     // it there after the steering stopped - boids would fly off outward and
     // never stop. Steering velocity always decays back toward accel/DRAG.
     vel.xz += (accel.xz - vel.xz) * min(6.0 * pc.params.x, 1.0);
-    vel.y += accel.y * pc.params.x;
+    // Steering is purely horizontal (XZ plane) - vertical velocity stays gravity/blast driven.
     // STAND AND FIGHT: kill horizontal velocity so the boid plants its feet
     // while in melee (vertical motion untouched - gravity still applies).
     if (stand_ground || building_now) {
@@ -965,7 +1328,19 @@ void main() {
     vel.y -= 9.8 * pc.params.x;
     // Cap the HORIZONTAL speed: with drag-based steering the XZ plan is
     // where runaway motion lived. Y stays gravity-driven (falls, settling).
-    float max_speed = 8.0;
+    // FORMAL MOVEMENT paces: marching columns walk at MARCH_SPEED, strolling
+    // and building dots at WALK_SPEED (walk_to already clamps its own
+    // output, so the cap is a net for everything else). Combat and panic
+    // keep the old urgency; the NPC horde roams at a lively pace.
+    float max_speed;
+    if (fighting || fleeing) {
+        max_speed = 8.0;
+    } else if ((state & STATE_HAS_PATH) != 0u) {
+        max_speed = MARCH_SPEED;
+    } else {
+        max_speed = WALK_SPEED;
+    }
+    if (is_npc) max_speed = max(max_speed, 5.0);
     float hspeed = length(vel.xz);
     if (hspeed > max_speed) vel.xz *= max_speed / hspeed;
     if (vel.y < -30.0) vel.y = -30.0;
@@ -981,10 +1356,28 @@ void main() {
         state &= ~STATE_FIGHTING;
     }
 
-    // clamp to world bounds
+    // clamp to world bounds. The Y floor follows the terrain: valleys dip
+    // below the flat world minimum, so the clamp uses min(world_min.y, ground)
+    // and the raise below does the rest.
+    float ground = terrain_height(pos.xz);
     vec3 wmin = pc.world_min.xyz;
-    vec3 wmax = wmin + vec3(dims.x, 100.0, dims.z) * cell_size;
+    wmin.y = min(wmin.y, ground);
+    vec3 wmax = pc.world_min.xyz + vec3(dims.x, 100.0, dims.z) * cell_size;
     pos = clamp(pos, wmin, wmax);
+    // GROUND: rest on the heightmap terrain instead of the flat world
+    // floor. terrain_height() reproduces HexTile._sample_height, so a dot
+    // settles exactly on the visible mesh. The raise dominates on hills
+    // (ground > world_min.y); the relaxed clamp above lets dots dip into
+    // valleys (ground < world_min.y). Falling dots never get here (early
+    // return above) - they drop through the collapsed hole and die on the
+    // floor check in their own branch.
+    if (pos.y < ground) {
+        pos.y = ground;
+        if (vel.y < 0.0) vel.y = 0.0;
+    } else if (vel.y <= 0.0 && (pos.y - ground) < 4.0) {
+        pos.y = ground;
+        vel.y = 0.0;
+    }
 
     // HARD hex boundary: if the boid left its hex and has no path AND isn't
     // fighting, snap back. Fighting boids may cross hexes in pursuit - and
@@ -993,7 +1386,7 @@ void main() {
     bool hex_free = (state & (STATE_HAS_PATH | STATE_FIGHTING)) != 0u || is_npc;
     if (new_hex_id != original_hex_id && !hex_free) {
         pos.xz = original_pos.xz;
-        vel.xz = vec2(0.0);  // dampen on bounce
+        vel.xz *= -1;  // dampen on bounce
     }
 
     // --- WALLS BLOCK BOIDS (bump-then-give-up) ---
@@ -1017,56 +1410,58 @@ void main() {
         if (cell_building_id(packed_w) == BUILDING_WALL
             && cell_building_is_built(packed_w)
             && int(cell_building_team(packed_w)) != my_team) {
-            wall_ci = int(wci);
+            // wall_ci = int(wci);
+            pos.xz = original_pos.xz;
+            vel.xz *= -1;  // dampen on bounce
         }
     }
-    if (wall_ci >= 0) {
-        uint widx = uint(wall_ci) & 0x0FFFFFFFu;
-        if (widx != last_wall) {
-            wall_bumps = 1u;      // a different wall: fresh count
-            last_wall = widx;
-        } else {
-            wall_bumps++;
-        }
-        // Entry direction must be read BEFORE the position is rolled back.
-        vec2 entry = pos.xz - original_pos.xz;
-        // Push back to the pre-move position (both branches).
-        pos.xz = original_pos.xz;
-        if (wall_bumps >= WALL_BUMP_LIMIT) {
-            // GIVE UP: drop the path and clear every special state so the
-            // boid goes back to plain ALIVE - hex-bound, wandering its own
-            // hex (NOT the wall's hex) instead of grinding against the wall.
-            wall_bumps = 0u;
-            vel.xz = vec2(0.0);
-            if (assigned_hex != NO_PATH && assigned_slot < 10u) {
-                // Cooldown: assigned_slot temporarily stores a sim-time
-                // deadline (>= 10, kept out of the 0..9 slot range) so the
-                // boid doesn't instantly re-claim the same blocked path. It
-                // lasts until the blocked path expires (or ~2s otherwise).
-                float blocked_exp = global_paths.hex_paths[int(assigned_hex) * num_teams + my_team].paths[assigned_slot].expiry;
-                uint cooldown = (blocked_exp > pc.params.w)
-                    ? uint(blocked_exp) + 1u
-                    : uint(pc.params.w) + 2u;
-                if (cooldown < 10u) cooldown = 10u;
-                assigned_slot = cooldown;
-            }
-            assigned_hex = NO_PATH;
-            state = STATE_ALIVE;
-            // Home is now the hex we're actually standing in - otherwise
-            // the post-fight "return home" walk would drag us into the wall.
-            home_hex = original_hex_id;
-        } else {
-            // BOUNCE: reflect the dominant entry axis (damped) so the bump
-            // reads physically; the other axis keeps sliding, letting the
-            // boid edge along the wall while it keeps trying to push in.
-            // NOTE: entry is a vec2 packed as (dx, dz) - .y is the Z axis.
-            if (abs(entry.x) > abs(entry.y)) {
-                vel.x = -vel.x * 0.4;
-            } else {
-                vel.z = -vel.z * 0.4;
-            }
-        }
-    }
+    // if (wall_ci >= 0) {
+    //     uint widx = uint(wall_ci) & 0x0FFFFFFFu;
+    //     if (widx != last_wall) {
+    //         wall_bumps = 1u;      // a different wall: fresh count
+    //         last_wall = widx;
+    //     } else {
+    //         wall_bumps++;
+    //     }
+    //     // Entry direction must be read BEFORE the position is rolled back.
+    //     vec2 entry = pos.xz - original_pos.xz;
+    //     // Push back to the pre-move position (both branches).
+    //     pos.xz = original_pos.xz;
+    //     if (wall_bumps >= WALL_BUMP_LIMIT) {
+    //         // GIVE UP: drop the path and clear every special state so the
+    //         // boid goes back to plain ALIVE - hex-bound, wandering its own
+    //         // hex (NOT the wall's hex) instead of grinding against the wall.
+    //         wall_bumps = 0u;
+    //         vel.xz = vec2(0.0);
+    //         if (assigned_hex != NO_PATH && assigned_slot < 10u) {
+    //             // Cooldown: assigned_slot temporarily stores a sim-time
+    //             // deadline (>= 10, kept out of the 0..9 slot range) so the
+    //             // boid doesn't instantly re-claim the same blocked path. It
+    //             // lasts until the blocked path expires (or ~2s otherwise).
+    //             float blocked_exp = global_paths.hex_paths[int(assigned_hex) * num_teams + my_team].paths[assigned_slot].expiry;
+    //             uint cooldown = (blocked_exp > pc.params.w)
+    //                 ? uint(blocked_exp) + 1u
+    //                 : uint(pc.params.w) + 2u;
+    //             if (cooldown < 10u) cooldown = 10u;
+    //             assigned_slot = cooldown;
+    //         }
+    //         assigned_hex = NO_PATH;
+    //         state = STATE_ALIVE;
+    //         // Home is now the hex we're actually standing in - otherwise
+    //         // the post-fight "return home" walk would drag us into the wall.
+    //         home_hex = original_hex_id;
+    //     } else {
+    //         // BOUNCE: reflect the dominant entry axis (damped) so the bump
+    //         // reads physically; the other axis keeps sliding, letting the
+    //         // boid edge along the wall while it keeps trying to push in.
+    //         // NOTE: entry is a vec2 packed as (dx, dz) - .y is the Z axis.
+    //         if (abs(entry.x) > abs(entry.y)) {
+    //             vel.x = -vel.x * 0.4;
+    //         } else {
+    //             vel.z = -vel.z * 0.4;
+    //         }
+    //     }
+    // (wall bump give-up block disabled - wall touch now bounces in place)
 
     // --- STARVATION: when the CPU flags the team out of resources, every
     // boid bleeds ~2 HP/s (hash-staggered so the damage spreads across the

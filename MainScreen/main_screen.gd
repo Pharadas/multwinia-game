@@ -89,8 +89,9 @@ var _drop_timer := 0.0
 ## corners of the map, whatever grid_width/grid_depth are. Each is a
 ## [min_col, min_row, max_col, max_row] rectangle just inside the outermost
 ## (always-wall) ring, enclosed by walls with a single exit facing the map
-## center, and gets exactly one generator - see _build_team_bases(). Keep
-## max_teams (socket.gd) in sync with the team count (4 corners).
+## center, and gets exactly one generator - see _build_team_bases(). The
+## team count comes from the sim's num_teams (stupid_simple.gd); the socket
+## is synced to it in _connect_sim_signals().
 var team_bases: Array = []
 
 ## Team-base layout state, computed by _build_team_bases() before any tile
@@ -137,11 +138,13 @@ func _connect_sim_signals() -> void:
 		ss.mine_owner_changed.connect(_on_mine_owner_changed)
 	if ss.has_signal("resources_changed") and not ss.resources_changed.is_connected(_on_resources_changed):
 		ss.resources_changed.connect(_on_resources_changed)
-	# Size the sim's team slots to the socket's playable team count plus the
-	# reserved NPC horde slot, so both sides always agree. No-op after start.
+	# The sim's num_teams (stupid_simple.gd) is the source of truth for the
+	# whole run and is frozen once its GPU buffers exist - so the socket
+	# follows it instead of the other way around: phones get handed team ids
+	# 0..num_teams-2 (the last sim slot is the reserved NPC horde).
 	var socket := get_node_or_null("Socket")
-	if socket != null and "max_teams" in socket and ss.has_method("set_num_teams"):
-		ss.set_num_teams(int(socket.max_teams) + 1)
+	if socket != null and "max_teams" in socket and "num_teams" in ss:
+		socket.max_teams = int(ss.num_teams) - 1
 	if ss.has_method("set_dot_count_per_team"):
 		ss.set_dot_count_per_team(dots_per_team)
 	# Give any already-connected phone the current pools immediately.
@@ -187,6 +190,11 @@ func _on_mine_collapsed(cell: Vector2i, world_pos: Vector2) -> void:
 		mgr.clear_hex(best.col, best.row)
 	hex_nodes.erase(Vector2i(best.col, best.row))
 	best.queue_free()
+	# The 2D phone map loses the hex too, and the mining frontier advances
+	# one ring inward (the hole is now the map edge for placement purposes).
+	var socket := get_node_or_null("Socket")
+	if socket and socket.has_method("broadcast_hex_destroyed"):
+		socket.broadcast_hex_destroyed(best.col, best.row)
 
 
 func _on_player_joined(team: int) -> void:
@@ -302,6 +310,17 @@ func _update_path_visuals(delta: float) -> void:
 ## Boids from the owning team march there and flip the flag (sim.glsl's
 ## construction block); a poll timer then swaps in the full-size mesh.
 func _on_building_placed_remote(col: int, row: int, building_id: int, team: int) -> void:
+	# building_id -1 = removal request (long-press). Only barracks can be
+	# removed - mines are the frontier economy, walls are the map itself.
+	if building_id < 0:
+		_remove_building(col, row)
+		return
+	# MINER FRONTIER: player mines are only allowed on the outermost ring
+	# of remaining hexes - the map is mined outside-in. The phone applies
+	# the same rule; this is the authoritative server-side check.
+	if building_id == 1 and not is_frontier_hex(col, row):
+		print("Placement rejected: mines can only be placed on the outer ring (frontier)")
+		return
 	# PAY FIRST: walls cost the placing team 100 resources. A team that
 	# can't afford it gets nothing - no ghost, no GPU site, no refund.
 	var ss_node := get_node_or_null("StupidSimple")
@@ -342,6 +361,34 @@ func _on_building_placed_remote(col: int, row: int, building_id: int, team: int)
 var _pending_builds: Array = []
 var _build_poll_timer: Timer = null
 
+
+## The mining frontier: the outermost ring of hex tiles still standing.
+## A hex is frontier when ANY of its 6 neighbors is gone (destroyed by a
+## mine collapse or off the original grid) - so the first mined-out ring
+## opens exactly the next ring inward. Mines may only be placed here.
+func is_frontier_hex(col: int, row: int) -> bool:
+	if not hex_nodes.has(Vector2i(col, row)):
+		return false
+	for d in [Vector2i(0, -1), Vector2i(0, 1), Vector2i(-1, -1), Vector2i(1, -1), Vector2i(-1, 0), Vector2i(1, 0)]:
+		if not hex_nodes.has(Vector2i(col + d.x, row + d.y)):
+			return true
+	return false
+
+
+## A phone long-pressed a barrack: tear the whole thing down - 3D mesh,
+## GPU cell_info word, site record, and the extra army slots it produced
+## into (the cap shrinks back). Mines and walls refuse.
+func _remove_building(col: int, row: int, team: int = -1) -> void:
+	var ss_node := get_node_or_null("StupidSimple")
+	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	var wp := get_hex_center(col, row)
+	if ss and ss.has_method("remove_building_at"):
+		if not ss.remove_building_at(Vector2(wp.x, wp.z)):
+			return  # not a removable barrack - nothing to do
+	var mgr := get_node_or_null("HexBuildingManager")
+	if mgr:
+		mgr.clear_hex(col, row)
+
 ## Every 0.5s, check the GPU built-flag for each pending construction site;
 ## when a boid has flipped it, swap the ghost mesh for the real building.
 func _poll_building_builds() -> void:
@@ -351,11 +398,17 @@ func _poll_building_builds() -> void:
 	var i := _pending_builds.size() - 1
 	while i >= 0:
 		var site: Dictionary = _pending_builds[i]
-		var node: Node3D = site.node
-		if not is_instance_valid(node):
+		# site.node can be a PREVIOUSLY FREED instance (the building was
+		# demolished by a phone long-press, or its hex collapsed mid-build).
+		# Assigning that straight into a typed Node3D local is a hard error
+		# BEFORE the validity check could run, so probe the untyped value
+		# first and only type it once it's known alive.
+		var node_raw: Variant = site.get("node")
+		if not is_instance_valid(node_raw):
 			_pending_builds.remove_at(i)
 			i -= 1
 			continue
+		var node: Node3D = node_raw
 		if ss and ss.has_method("is_building_built"):
 			# Resolve the site's world position back to its grid cell.
 			var wp := node.global_position
@@ -378,7 +431,7 @@ func _poll_building_builds() -> void:
 				# Re-mark the buffer built (boid already did it, this keeps
 				# CPU/GPU in sync if the buffer was re-uploaded meanwhile).
 				if ss.has_method("set_cell_building"):
-					ss.set_cell_building(Vector2(wp.x, wp.z), site.building_id, site.team, 0, 0, true)
+					ss.set_cell_building(Vector2(wp.x, wp.z), site.building_id, site.team, true)
 				_pending_builds.remove_at(i)
 		i -= 1
 	if _pending_builds.is_empty() and _build_poll_timer:
@@ -422,7 +475,7 @@ func _push_building_to_cell_info(col: int, row: int, building_id: int, team: int
 	# node.global_position IS the hex center (the manager places it there);
 	# resolve that to its grid cell. set_cell_building takes the XZ plane.
 	var wp := node.global_position
-	ss.set_cell_building(Vector2(wp.x, wp.z), building_id, team, 0, 0, built)
+	ss.set_cell_building(Vector2(wp.x, wp.z), building_id, team, built)
 
 ## The old single-mesh version of this script wrote the whole terrain's
 ## collision into a CollisionShape3D sibling (under the parent StaticBody3D).
@@ -512,6 +565,16 @@ func generate_terrain() -> void:
 		fallback.vertex_color_use_as_albedo = true
 		shared_mat = null
 
+	# Fast-build context shared by every tile in this pass: one heightfield
+	# (the image's red channel copied into a packed float array once, so
+	# mesh building never calls Image.get_pixel again) and one mesh builder
+	# (raw packed arrays instead of SurfaceTool). Injected into every tile
+	# before build(); tiles that skip it fall back to the legacy path.
+	var heightfield := Heightfield.new()
+	heightfield.initialize(img, height_scale)
+	var mesh_builder := HexMeshBuilder.new(heightfield)
+	var t_build := Time.get_ticks_msec()
+
 	# Work out the team base walls/exits/generators before any tile spawns,
 	# so each tile below can consult them.
 	_build_team_bases()
@@ -531,12 +594,15 @@ func generate_terrain() -> void:
 			# team base interiors/exits/corridors are always open. Everything
 			# else rolls against wall_tile_chance.
 			var is_outer := col == 0 or col == grid_width - 1 or row == 0 or row == grid_depth - 1
-			var forced_wall := is_outer or _force_walls.has(key)
+			# var forced_wall := is_outer or _force_walls.has(key)
+			var forced_wall := false
 			var forced_open := (col == grid_width / 2 and row == grid_depth / 2) or _force_open.has(key)
 			var is_wall := forced_wall
-			if not forced_wall and not forced_open:
+			# if not forced_wall and not forced_open:
+			if false:
 				is_wall = rng.randf() < wall_tile_chance
-			_spawn_hex(col, row, img, width, depth, center_u, center_v, sector_color, shared_mat, vertex_cache, is_wall)
+			_spawn_hex(col, row, img, width, depth, center_u, center_v, sector_color, shared_mat, vertex_cache, is_wall, mesh_builder)
+	print("[terrain] mesh build: %d ms" % (Time.get_ticks_msec() - t_build))
 
 	terrain_ready.emit()
 	_push_over_network()
@@ -694,7 +760,10 @@ func _build_team_bases() -> void:
 
 
 ## Instances the tile scene and hands it everything it needs to build itself.
-func _spawn_hex(col: int, row: int, img: Image, width: int, depth: int, center_u: float, center_v: float, color: Color, mat: Material, vertex_cache: Dictionary, is_wall: bool) -> void:
+## `builder` (optional) switches the tile onto the fast packed-array mesh
+## path - see HexMeshBuilder. build() itself still receives the image/
+## vertex_cache parameters so the legacy SurfaceTool path stays available.
+func _spawn_hex(col: int, row: int, img: Image, width: int, depth: int, center_u: float, center_v: float, color: Color, mat: Material, vertex_cache: Dictionary, is_wall: bool, builder: HexMeshBuilder = null) -> void:
 	var tile: HexTile = hex_tile_scene.instantiate()
 	add_child(tile)
 	var key := _tile_key(col, row)
@@ -703,6 +772,8 @@ func _spawn_hex(col: int, row: int, img: Image, width: int, depth: int, center_u
 	tile.force_generator = false
 	# tile.no_random_generator = _no_random_generators.has(key)
 	tile.no_random_generator = true
+	if builder != null:
+		tile.set_fast_builder(builder)
 	tile.build(col, row, img, width, depth, center_u, center_v, hex_size, hex_detail, height_scale, mesh_scale, color, mat, vertex_cache)
 	tile.hex_clicked.connect(_on_hex_clicked)
 
@@ -870,6 +941,19 @@ func _on_terrain_ready() -> void:
 	if ss_node == null or ss_node.get_child_count() == 0:
 		return
 	var ss = ss_node.get_child(0)
+	# Upload the heightmap to the sim's GPU buffer BEFORE the first sim frame
+	# uses it: dots then clamp to the heightmap terrain (sim.glsl's
+	# terrain_height(), the GPU twin of HexTile._sample_height) instead of
+	# the flat world floor. Until the upload lands the sim runs on its
+	# placeholder buffer (zero_size == 0) and keeps the old flat behavior.
+	if ss.has_method("set_heightmap") and heightmap_image:
+		var hmap_img: Image = heightmap_image.get_image()
+		if hmap_img:
+			ss.set_heightmap(hmap_img, height_scale)
+			if ss.has_method("rebuild_sim_uniform_sets"):
+				ss.rebuild_sim_uniform_sets()
+		else:
+			push_warning("_on_terrain_ready: heightmap has no image yet - dots stay on the flat floor.")
 	# Bulk path: one read + one write of the whole cell_info buffer (~800
 	# walls). Per-tile buffer_update calls stalled startup badly.
 	if ss.has_method("set_terrain_walls"):
@@ -881,6 +965,13 @@ func _on_terrain_ready() -> void:
 			var center := get_hex_center(key.x, key.y)
 			walls.append(Vector2(center.x, center.z))
 		ss.set_terrain_walls(walls)
+		# Special center mine + its 7 guardian miners: a permanent neutral
+		# mine worth 3x a regular one while the miners live (see
+		# stupid_simple.gd's setup_special_mine). Called AFTER the wall bulk
+		# write so the mine's word overwrites the center hex's slot.
+		if ss.has_method("setup_special_mine"):
+			var c := get_hex_center(grid_width / 2, grid_depth / 2)
+			ss.setup_special_mine(Vector2(c.x, c.z))
 		return
 	# Fallback: per-tile writes (older sim without the bulk method).
 	if not ss.has_method("set_cell_building"):
@@ -890,7 +981,7 @@ func _on_terrain_ready() -> void:
 		if tile == null or not tile.is_wall:
 			continue
 		var center := get_hex_center(key.x, key.y)
-		ss.set_cell_building(Vector2(center.x, center.z), 2, 255, 0, 0, true)
+		ss.set_cell_building(Vector2(center.x, center.z), 2, 255, true)
 	# _spawn_drop_box()
 
 

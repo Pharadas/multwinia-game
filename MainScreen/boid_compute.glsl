@@ -262,7 +262,13 @@ if (params.pass_id < 0.5) {
 			new_position.xz = new_center.xz + (to_new / d_new) * params.hex_radius;
 		}
 	}
-	
+
+	// Snap Y to the terrain surface of whichever hex the dot is now on.
+	// new_hex_id is already the resolved destination (current or newly
+	// transitioned), so this covers moving, holding, and hex-crossing in
+	// one place — no dot can float or sink regardless of its initial Y.
+	new_position.y = hex_world_position_buf.data[new_hex_id].xyz.y;
+
 dot_world_position_buf.data[dot_id] = vec4(new_position, float(new_hex_id));
 	dot_velocity_buf.data[dot_id] = vec4(0.0);
 }

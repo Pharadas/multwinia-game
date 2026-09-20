@@ -71,7 +71,20 @@ var _glow_material: ORMMaterial3D = null
 ## Cached at build() time instead of doing get_child(0) lookups repeatedly.
 var _mesh_instance: MeshInstance3D = null
 
+## Optional fast-build context, injected by the terrain spawner before
+## build(): when set, the tile's mesh is produced by HexMeshBuilder (raw
+## packed arrays, indexed) instead of the legacy SurfaceTool path - same
+## output, a fraction of the build time. See HexMeshBuilder's header.
+var _builder: HexMeshBuilder = null
+
 var generator = preload("res://WorldObjects/Generator.tscn")
+
+
+## Injects the shared fast mesh builder (one per terrain generation, see
+## main_screen.gd's generate_terrain). Call before build(); when absent,
+## build() falls back to the legacy SurfaceTool path.
+func set_fast_builder(builder: HexMeshBuilder) -> void:
+	_builder = builder
 
 ## Whether this tile is a solid wall: it covers the whole hexagon and
 ## nothing can pass through it. Set by the terrain spawner (see
@@ -133,26 +146,36 @@ func build(
 	# instead of staying at (0,0,0).
 	position = Vector3(center_u * mesh_scale, 0.0, center_v * mesh_scale)
 
-	var st := SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	# Fast path (default when the spawner injected a builder): raw packed
+	# arrays with an index buffer - same tessellation, heights, winding and
+	# smoothing-group normals as the legacy path below, at a fraction of the
+	# cost. generate_tangents() is dropped: hex_sector.gdshader never reads
+	# tangents, and it was a large chunk of the old build time.
+	var hex_mesh: ArrayMesh
+	if _builder != null:
+		_builder.tile_color = color_param
+		hex_mesh = _builder.build(center_u, center_v, hex_size, hex_detail, mesh_scale, mat)
+	else:
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
 
-	var corner_uv: Array[Vector2] = []
-	for i in range(6):
-		var angle := deg_to_rad(60 * i)
-		corner_uv.append(Vector2(center_u + hex_size * cos(angle), center_v + hex_size * sin(angle)))
+		var corner_uv: Array[Vector2] = []
+		for i in range(6):
+			var angle := deg_to_rad(60 * i)
+			corner_uv.append(Vector2(center_u + hex_size * cos(angle), center_v + hex_size * sin(angle)))
 
-	for i in range(6):
-		_add_wedge(
-			st, img, width, depth, vertex_cache,
-			Vector2(center_u, center_v), corner_uv[i], corner_uv[(i + 1) % 6],
-			color_param, hex_detail, height_scale, mesh_scale
-		)
+		for i in range(6):
+			_add_wedge(
+				st, img, width, depth, vertex_cache,
+				Vector2(center_u, center_v), corner_uv[i], corner_uv[(i + 1) % 6],
+				color_param, hex_detail, height_scale, mesh_scale
+			)
 
-	st.generate_normals()
-	st.generate_tangents()
-	var hex_mesh: ArrayMesh = st.commit()
-	if mat:
-		hex_mesh.surface_set_material(0, mat)
+		st.generate_normals()
+		st.generate_tangents()
+		hex_mesh = st.commit()
+		if mat:
+			hex_mesh.surface_set_material(0, mat)
 
 	var mesh_instance := MeshInstance3D.new()
 	mesh_instance.name = "MeshInstance3D"
