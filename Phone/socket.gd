@@ -86,6 +86,10 @@ var _ws_url := ""
 var _ws_retry_elapsed := 0.0
 ## Manual UI override for the WS host - non-empty wins over all URL resolution.
 var remote_host_override := ""
+## TLS flag for the override: true when the typed address was wss:// (needed
+## whenever the page itself is HTTPS - itch.io, GitHub Pages - because
+## browsers block insecure ws:// from secure pages as mixed content).
+var remote_use_tls := false
 
 var _discovery_udp := PacketPeerUDP.new()
 var _discovery_elapsed := 0.0
@@ -184,7 +188,8 @@ func _resolve_web_url() -> String:
 	var ws_port := websocket_port
 	# A UI-typed override wins over everything.
 	if not remote_host_override.is_empty():
-		return "ws://%s:%d" % [remote_host_override, ws_port]
+		var scheme := "wss" if remote_use_tls else "ws"
+		return "%s://%s:%d" % [scheme, remote_host_override, ws_port]
 	if OS.has_feature("web"):
 		# JavaScriptBridge.eval returns JS objects as opaque JavaScriptObjects -
 		# NOT GDScript Dictionaries - so pull out plain strings instead.
@@ -251,24 +256,26 @@ func _ws_send(msg: Dictionary) -> void:
 		_ws.send_text(JSON.stringify(_jsonify(msg)))
 
 ## Manual override from the UI: point the WebSocket at a typed address,
-## then reconnect immediately. Accepts "IP", "IP:port", "ws://IP:port" or
-## a full ws:// URL. Overrides every automatic URL resolution - call with
-## an empty string to go back to automatic.
+## then reconnect immediately. Accepts "IP", "IP:port", "ws://IP:port",
+## "wss://IP:port" or a full URL (wss is REQUIRED when the page itself is
+## served over HTTPS - itch.io, GitHub Pages - otherwise the browser blocks
+## the connection as mixed content). Overrides every automatic URL
+## resolution - call with an empty string to go back to automatic.
 func set_remote_target(target: String, new_port: int = 0) -> void:
 	if not _is_web:
 		return
 	var t := target.strip_edges()
-	# Full URL form: pull host:port out of it.
-	if t.begins_with("ws://"):
-		t = t.trim_prefix("ws://")
-		var slash := t.find("/")
-		if slash >= 0:
-			t = t.substr(0, slash)
-	elif t.begins_with("wss://"):
+	# Full URL form: pull host:port out of it and remember the scheme.
+	remote_use_tls = false
+	if t.begins_with("wss://"):
+		remote_use_tls = true
 		t = t.trim_prefix("wss://")
-		var slash := t.find("/")
-		if slash >= 0:
-			t = t.substr(0, slash)
+	elif t.begins_with("ws://"):
+		t = t.trim_prefix("ws://")
+	# Strip any path ("wss://host/whatever" -> "host"); we dial the root.
+	var slash := t.find("/")
+	if slash >= 0:
+		t = t.substr(0, slash)
 	# "host:port" form: split the port off.
 	var colon := t.rfind(":")
 	if colon > 0:
