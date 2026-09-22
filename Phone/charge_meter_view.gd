@@ -3,10 +3,14 @@ extends Control
 
 ## Radial charge meter for the hold-to-charge order mechanic: after drawing
 ## a path, keeping the pointer held fills a ring 0 -> 100% over the charge
-## time (3 s). Pure view: PhoneInputController's charge_progressed signal
+## time (1.75 s). Pure view: PhoneInputController's charge_progressed signal
 ## drives it; the facade positions it each frame while active.
 ##
 ## Drawn with _draw() only - no textures, no shaders.
+
+## The ring is drawn OFFSET up-right of the pointer position passed to
+## show_at() so it never sits on top of the finger / tap point.
+const POINTER_OFFSET := Vector2(52.0, -52.0)
 
 const RING_RADIUS := 34.0
 const RING_WIDTH := 6.0
@@ -26,7 +30,8 @@ func _ready() -> void:
 func show_at(screen_pos: Vector2) -> void:
 	if not visible:
 		visible = true
-	position = screen_pos - Vector2(RING_RADIUS + RING_WIDTH, RING_RADIUS + RING_WIDTH)
+	position = screen_pos + POINTER_OFFSET \
+			- Vector2(RING_RADIUS + RING_WIDTH, RING_RADIUS + RING_WIDTH)
 
 
 func set_fraction(f: float) -> void:

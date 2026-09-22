@@ -118,7 +118,7 @@ var _dots_per_team: int = 0
 ## deserters. No phone is ever assigned it, no boid spawns in it, but
 ## starving boids randomly defect into it and it fights everyone. Player
 ## teams are 0..num_teams - 2.
-var num_teams: int = 3
+var num_teams: int = 5
 
 ## How fast broke teams bleed units to the horde. Each in-debt boid converts
 ## with per-frame chance min(deficit * DESERTION_RATE, 0.0005) (plus a slow
@@ -857,8 +857,12 @@ var _hex_path_counts: Dictionary = {}
 ## Whole-hex granularity: there are no sub-hex coordinates anymore (bits
 ## 16-30 are the GPU build-progress counter and must start at zero).
 const BUILDING_BUILT_FLAG := 0x80000000
+## Bit 30 of the packed word: "marked for demolition" (phone double-tapped
+## the wall). Dots near a marked wall chip its build progress to zero and
+## the word gets wiped. Must match sim.glsl's DELETE_MARK_BIT.
+const BUILDING_DELETE_MARK_FLAG := 0x40000000
 
-func set_cell_building(world_pos: Vector2, building_id: int, team: int, built: bool = true) -> void:
+func set_cell_building(world_pos: Vector2, building_id: int, team: int, built: bool = true, mark_for_delete: bool = false) -> void:
 	var packed: int
 	if building_id < 0:
 		packed = 0xFF  # "none"
@@ -866,6 +870,8 @@ func set_cell_building(world_pos: Vector2, building_id: int, team: int, built: b
 		packed = (building_id & 0xFF) | ((team & 0xFF) << 8)
 	if built:
 		packed |= BUILDING_BUILT_FLAG
+	if mark_for_delete:
+		packed |= BUILDING_DELETE_MARK_FLAG
 
 	# Which grid cell does this building's center fall in?
 	# NOTE: world_pos is an XZ Vector2 (x = world x, y = world z), so the
@@ -1460,7 +1466,16 @@ func _spawn_miner(boid_id: int, ring: float) -> void:
 	row[2] = pos_z
 	row[3] = 0.0
 	row[4] = 0.0; row[5] = 0.0; row[6] = 0.0; row[7] = 0.0
-	row[8] = STATE_MINER_FLAG  # state: miner
+	# state: miner. MUST be bit-packed like every other uint field here:
+	# assigning the int directly stored float 128.0 (bits 0x43000000), which
+	# shares NO bits with STATE_MINER (0x80). The 7 miners therefore spawned
+	# as plain NPC dots - gray "deserters" roaming out of the map center -
+	# instead of gold, hex-locked miners (the sim's miner early-out never
+	# fired, so nothing re-set the flag either).
+	var sb := PackedByteArray()
+	sb.resize(4)
+	sb.encode_u32(0, STATE_MINER_FLAG)
+	row[8] = sb.decode_float(0)
 	var np := PackedByteArray(); np.resize(4); np.encode_u32(0, 0xFFFFFFFF)
 	row[9] = np.decode_float(0)  # no path
 	row[10] = 0.0                # slot
@@ -1522,6 +1537,18 @@ func _collapse_mine(cell: Vector2i) -> void:
 	_building_sites.erase(cell)
 	mine_collapsed.emit(cell, mine.world)
 
+## Reads the raw packed building word for grid cell (cx, cz) (team 0
+## slice). Returns -1 when the buffer read fails. Bits match sim.glsl's
+## CellInfo layout: 0-7 id, 8-15 team, 16-29 build progress, 30 delete
+## mark, 31 built.
+func get_building_word(cx: int, cz: int) -> int:
+	var xz := grid_dims.x * grid_dims.z
+	var byte_off := (0 * xz + cz * grid_dims.x + cx) * 8 + 4  # team 0 slice
+	var data := rd.buffer_get_data(cell_info_rid, byte_off, 4)
+	if data.size() < 4:
+		return -1
+	return data.decode_u32(0)
+
 ## Reads the BUILT flag back from the GPU for the building in grid cell
 ## (cx, cz). Returns true when a boid has finished constructing it, false
 ## while it's still a site. Empty cell -> true (nothing to wait for).
@@ -1536,6 +1563,48 @@ func is_building_built(cx: int, cz: int) -> bool:
 		return true
 	var packed := data.decode_u32(0)
 	return (packed & BUILDING_BUILT_FLAG) != 0
+
+## True when the grid cell (cx, cz) holds no building anymore (word emptied
+## to 0xFF). Used by the wall-demolition poll: the sim wipes a marked
+## wall's word once dots have fully chipped it down.
+func is_building_cleared(cx: int, cz: int) -> bool:
+	var xz := grid_dims.x * grid_dims.z
+	var byte_off := (0 * xz + cz * grid_dims.x + cx) * 8 + 4  # team 0 slice
+	var data := rd.buffer_get_data(cell_info_rid, byte_off, 4)
+	if data.size() < 4:
+		return false
+	return (data.decode_u32(0) & 0xFF) == 0xFF
+
+## Clears the building word (back to empty 0xFF) in every team slice of
+## every grid cell whose center lies inside the hex at `world_pos` - the
+## inverse of set_cell_building()'s built-wall coverage fan-out. Used when
+## a marked wall is torn down so no blocking word survives on the GPU.
+func clear_building_at_hex(world_pos: Vector2) -> void:
+	var cx := int(floor((world_pos.x - WORLD_MIN.x) / CELL_SIZE))
+	var cz := int(floor((world_pos.y - WORLD_MIN.z) / CELL_SIZE))
+	cx = clampi(cx, 0, grid_dims.x - 1)
+	cz = clampi(cz, 0, grid_dims.z - 1)
+	var inner_r := hex_size * mesh_scale * 0.8660254
+	var half := ceili(inner_r / CELL_SIZE)
+	var covered: Array = []
+	for dx in range(-half, half + 1):
+		for dz in range(-half, half + 1):
+			var tx := clampi(cx + dx, 0, grid_dims.x - 1)
+			var tz := clampi(cz + dz, 0, grid_dims.z - 1)
+			var wx := (float(tx) + 0.5) * CELL_SIZE + WORLD_MIN.x
+			var wz := (float(tz) + 0.5) * CELL_SIZE + WORLD_MIN.z
+			if Vector2(wx, wz).distance_to(world_pos) <= inner_r:
+				covered.append(Vector2i(tx, tz))
+	var xz := grid_dims.x * grid_dims.z
+	var buf := PackedByteArray()
+	buf.resize(4)
+	buf.encode_u32(0, 0xFF)
+	for cell_v in covered:
+		var cell_idx: int = cell_v.y * grid_dims.x + cell_v.x
+		_building_sites.erase(Vector2i(cell_v.x, cell_v.y))
+		for t in range(num_teams):
+			var byte_off: int = (t * xz + cell_idx) * 8 + 4
+			rd.buffer_update(cell_info_rid, byte_off, 4, buf)
 
 ## Set the number of available paths stored for a given hex cell and team.
 func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:

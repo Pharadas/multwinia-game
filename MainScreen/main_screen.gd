@@ -120,6 +120,8 @@ func _ready() -> void:
 		socket.drawn_path_received.connect(_on_drawn_path_received)
 	if socket and socket.has_signal("building_placed_remote"):
 		socket.building_placed_remote.connect(_on_building_placed_remote)
+	if socket and socket.has_signal("wall_delete_marked"):
+		socket.wall_delete_marked.connect(_on_wall_delete_marked)
 	# The sim node is instanced with the scene, but its script child may not
 	# exist yet during _ready - defer so the connection always lands.
 	call_deferred("_connect_sim_signals")
@@ -340,6 +342,9 @@ func _on_building_placed_remote(col: int, row: int, building_id: int, team: int)
 		# ".." resolves to THIS node once the manager is added as a child -
 		# "." would resolve to the manager itself, which broke placement.
 		mgr.terrain_path = NodePath("..")
+		# Same node owns heightmap_image / height_scale, so buildings can
+		# sample the terrain height and never spawn underground.
+		mgr.heightmap_path = NodePath("..")
 		add_child(mgr)
 	var node: Node3D = mgr.place_building(col, row, building_id, team, false)
 
@@ -360,6 +365,87 @@ func _on_building_placed_remote(col: int, row: int, building_id: int, team: int)
 
 var _pending_builds: Array = []
 var _build_poll_timer: Timer = null
+
+## Walls marked for demolition (phone double-tap): Vector2i hex keys. The
+## sim's dots chip the marked wall's progress to zero, wipe its GPU word,
+## and this poll then removes the mesh + clears the buffer fan-out.
+var _pending_wall_deletes: Array = []
+var _wall_delete_timer: Timer = null
+
+## A phone double-tapped a hex: if it holds a BUILT, player-built wall
+## (team byte != 255 - terrain walls are the map itself and can't go),
+## toggle its demolition mark. The mark is bit 30 of the GPU building
+## word; dots near a marked wall tear it down (sim.glsl's demolition
+## block) and _poll_wall_deletes finishes the job CPU-side.
+func _on_wall_delete_marked(col: int, row: int, _team: int) -> void:
+	var key := Vector2i(col, row)
+	if not hex_nodes.has(key):
+		return
+	var ss_node := get_node_or_null("StupidSimple")
+	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	if ss == null or not ss.has_method("get_building_word") or not ss.has_method("set_cell_building"):
+		return
+	var wp := get_hex_center(col, row)
+	var cx := int(floor((wp.x - ss.WORLD_MIN.x) / ss.CELL_SIZE))
+	var cz := int(floor((wp.z - ss.WORLD_MIN.z) / ss.CELL_SIZE))
+	var word: int = ss.get_building_word(cx, cz)
+	if word < 0:
+		return
+	# Only built, player-built walls are demolishable.
+	if (word & 0xFF) != 2 or (word & ss.BUILDING_BUILT_FLAG) == 0:
+		return
+	var owner_team: int = (word >> 8) & 0xFF
+	if owner_team == 255:
+		return  # terrain wall - scenery, not demolishable
+	var marked := (word & 0x40000000) != 0
+	# set_cell_building rebuilds the word: same id/team/built, mark toggled.
+	ss.set_cell_building(Vector2(wp.x, wp.z), 2, owner_team, true, not marked)
+	if marked:
+		# Was marked -> now unmarked: forget any pending teardown.
+		_pending_wall_deletes.erase(key)
+	else:
+		if not _pending_wall_deletes.has(key):
+			_pending_wall_deletes.append(key)
+		if _wall_delete_timer == null:
+			_wall_delete_timer = Timer.new()
+			_wall_delete_timer.wait_time = 0.5
+			_wall_delete_timer.timeout.connect(_poll_wall_deletes)
+			add_child(_wall_delete_timer)
+		_wall_delete_timer.start()
+
+## Every 0.5s: for each wall pending demolition, check whether the sim has
+## wiped its GPU word (dots finished chipping). Then remove the building
+## mesh and the blocking cells - the hex TILE itself survives (unlike a
+## mine collapse, deleting a wall just clears the ground it stood on).
+func _poll_wall_deletes() -> void:
+	var ss_node := get_node_or_null("StupidSimple")
+	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	if ss == null or not ss.has_method("is_building_cleared"):
+		return
+	var i := _pending_wall_deletes.size() - 1
+	while i >= 0:
+		var key: Vector2i = _pending_wall_deletes[i]
+		_pending_wall_deletes.remove_at(i)
+		i -= 1
+		if not hex_nodes.has(key):
+			continue
+		var wp := get_hex_center(key.x, key.y)
+		var cx := int(floor((wp.x - ss.WORLD_MIN.x) / ss.CELL_SIZE))
+		var cz := int(floor((wp.z - ss.WORLD_MIN.z) / ss.CELL_SIZE))
+		if not ss.is_building_cleared(cx, cz):
+			continue
+		# Teardown complete: clear the buffer fan-out (the sim only wiped the
+		# center cell) and the 3D mesh, then tell every phone.
+		if ss.has_method("clear_building_at_hex"):
+			ss.clear_building_at_hex(Vector2(wp.x, wp.z))
+		var mgr := get_node_or_null("HexBuildingManager")
+		if mgr and mgr.has_method("clear_hex"):
+			mgr.clear_hex(key.x, key.y)
+		var socket := get_node_or_null("Socket")
+		if socket and socket.has_method("broadcast_wall_deleted"):
+			socket.broadcast_wall_deleted(key.x, key.y)
+	if _pending_wall_deletes.is_empty() and _wall_delete_timer:
+		_wall_delete_timer.stop()
 
 
 ## The mining frontier: the outermost ring of hex tiles still standing.

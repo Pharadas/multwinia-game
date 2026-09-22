@@ -10,6 +10,9 @@ var colors := {}      # Vector2i -> Color (from network data / terrain)
 var counts := {}      # Vector2i -> int (darwinian count)
 var walls := {}       # Vector2i -> bool (solid terrain tile)
 var buildings := {}   # Vector2i -> int building id (whole-hex, one per hex)
+## Vector2i set: walls marked "to be deleted" (double-tapped by the player;
+## dots on the 3D side tear them down).
+var delete_marked := {}
 
 
 func clear_tiles() -> void:
@@ -57,3 +60,4 @@ func erase_cell(cell: Vector2i) -> void:
 	counts.erase(cell)
 	walls.erase(cell)
 	buildings.erase(cell)
+	delete_marked.erase(cell)

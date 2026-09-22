@@ -12,8 +12,7 @@ extends Node2D
 ##   BuildingMarkerLayer    hex markers for placed buildings
 ##   BuildPreviewView       carry highlight (white ok / red rejected)
 ##   BuildingPalette        resource counter + building chips (CanvasLayer)
-##   ChargeMeterView        radial charge ring (charge grows while the finger
-##                          holds the gesture's start hex, freezes on leave)
+##   BuildRadialMenu        screen-space radial options (double-tap + hold)
 ##   PhoneInputController   touch/mouse -> path / tap / drop / remove intents
 ##   FrontierRing           outermost surviving hex ring where mines go
 ##
@@ -23,6 +22,9 @@ extends Node2D
 
 const DRAW_SAMPLE_COUNT := 16
 const PATH_LINE_COLOR := Color(1.0, 0.3, 0.3, 0.6)
+## Preloaded so the facade never depends on the global class cache having
+## scanned connect_screen.gd (fresh files aren't in it until a rescan).
+const ConnectScreenScript := preload("res://Phone/connect_screen.gd")
 
 @export var terrain_path: NodePath
 @export var socket_path: NodePath
@@ -47,7 +49,9 @@ var frontier := FrontierRing.new()
 var populator: MapPopulator
 var input: PhoneInputController
 var palette: BuildingPalette
+var radial_menu: BuildRadialMenu
 var charge_meter: ChargeMeterView
+var connect_screen
 var build_preview: BuildPreviewView
 var markers: BuildingMarkerLayer
 var count_labels: CountLabelLayer
@@ -86,9 +90,18 @@ func _build_components() -> void:
 	palette = BuildingPalette.new()
 	add_child(palette)
 
+	# Radial build menu (screen space); hidden until double-tap + hold.
+	radial_menu = BuildRadialMenu.new()
+	add_child(radial_menu)
+
 	# Hold-to-charge ring (screen space); hidden until a gesture charges.
 	charge_meter = ChargeMeterView.new()
 	add_child(charge_meter)
+
+	# Manual-connect overlay (web builds): shown while the socket is down,
+	# lets the player type the host's public IP to connect from anywhere.
+	connect_screen = ConnectScreenScript.new()
+	add_child(connect_screen)
 
 	# Everything drawn in grid space is a child of the TileMapLayer so it
 	# inherits the fit-to-screen transform.
@@ -98,6 +111,7 @@ func _build_components() -> void:
 
 	markers = BuildingMarkerLayer.new()
 	markers.buildings = state.buildings
+	markers.delete_marked = state.delete_marked
 	tile_map_layer.add_child(markers)
 
 	count_labels = CountLabelLayer.new()
@@ -113,13 +127,36 @@ func _connect_input() -> void:
 	input.building_remove_requested.connect(_on_building_remove_requested)
 	input.carry_preview_requested.connect(_on_carry_preview)
 	input.pointer_cell_changed.connect(_on_pointer_cell_changed)
+	input.build_menu_opened.connect(_on_build_menu_opened)
+	input.build_menu_pointer_moved.connect(_on_build_menu_pointer_moved)
+	input.build_menu_closed.connect(_on_build_menu_closed)
+	input.building_selected.connect(_on_building_selected)
 	input.charge_progressed.connect(_on_charge_progressed)
+	# Drag-to-select lookup: the controller asks the menu which option the
+	# finger is on when the gesture releases.
+	input.bind_menu_lookup(radial_menu.option_at)
 
 
 func _connect_socket() -> void:
 	var socket := _get_socket_node()
 	if socket and socket.has_signal("team_resources_received"):
 		socket.team_resources_received.connect(_on_team_resources_received)
+	if socket and socket.has_signal("connection_state_changed"):
+		socket.connection_state_changed.connect(_on_connection_state_changed)
+		# Initial state: web builds start disconnected, so show the screen.
+		_on_connection_state_changed(socket.is_web_connected() if socket.has_method("is_web_connected") else false)
+	if socket and connect_screen and not connect_screen.connect_requested.is_connected(_on_connect_requested):
+		connect_screen.connect_requested.connect(_on_connect_requested)
+
+## Typed address from the connect screen -> socket override + reconnect.
+func _on_connect_requested(target: String) -> void:
+	var socket := _get_socket_node()
+	if socket and socket.has_method("set_remote_target"):
+		socket.set_remote_target(target)
+
+func _on_connection_state_changed(connected: bool) -> void:
+	if connect_screen:
+		connect_screen.set_connection_state(connected)
 
 
 # --- terrain / network data ---------------------------------------------------
@@ -206,11 +243,39 @@ func _on_path_drawn(points: PackedVector2Array, charge: float) -> void:
 
 
 ## Hold-to-charge feedback: the charge grows while the finger holds the
-## hex the gesture started on (3 s = 100% of that hex's dots); leaving the
-## hex freezes it. The meter follows the pointer while charging.
+## hex the gesture started on (CHARGE_FULL_TIME = 100%); leaving the hex
+## freezes it. The meter offsets itself up-right of the pointer (see
+## ChargeMeterView) so it never covers the hex being charged.
 func _on_charge_progressed(fraction: float, _seconds_held: float) -> void:
 	charge_meter.show_at(input.last_screen_position())
 	charge_meter.set_fraction(fraction)
+
+
+## Build menu lifecycle: opens on double-tap + hold, highlights the option
+## under the dragging finger, and puts the chosen building in hand on
+## release (the next press becomes a carry gesture - drag to the target hex
+## and release to drop it there).
+func _on_build_menu_opened(_cell: Vector2i, screen_pos: Vector2) -> void:
+	charge_meter.hide_meter()
+	radial_menu.open(screen_pos)
+
+
+func _on_build_menu_pointer_moved(screen_pos: Vector2) -> void:
+	radial_menu.update_pointer(screen_pos)
+
+
+func _on_build_menu_closed() -> void:
+	radial_menu.close()
+
+
+func _on_building_selected(_cell: Vector2i, building_id: int) -> void:
+	if tile_map_layer == null:
+		return
+	var screen_pos := input.last_screen_position()
+	input.pick_up_building(building_id, screen_pos,
+			func(pos: Vector2) -> Vector2: return tile_map_layer.to_local(pos))
+	var cell := _screen_to_cell(screen_pos)
+	build_preview.show_cell(cell, _drop_allowed(cell, building_id))
 
 
 ## Removal-gesture policy for the input controller: a hex is a demolish
@@ -221,12 +286,45 @@ func _can_remove_at(cell: Vector2i) -> bool:
 
 
 func _on_cell_tapped(cell: Vector2i) -> void:
-	# A tap selects the hex: same-process tile call + network broadcast.
-	# (A hold that never drew also ends here - drop its charge meter; a
-	# charge without a path is nothing.)
 	charge_meter.hide_meter()
+	# A tap selects the hex: same-process tile call + network broadcast.
+	# (A tap is also the first half of the double-tap that arms the build
+	# menu - see PhoneInputController.)
 	_call_tile_function(cell.x, cell.y)
 	_send_click_over_network(cell)
+	# Double-tap on a WALL marks it for demolition (an X appears); another
+	# double-tap on the same wall unmarks it. Mines/barracks are untouched.
+	var now := Time.get_ticks_msec() / 1000.0
+	if cell == _last_tap_cell and now - _last_tap_time <= 0.4 \
+			and state.is_wall_at(cell) and state.building_at(cell) == BuildingTypes.REMOVE:
+		_toggle_wall_delete(cell)
+	_last_tap_cell = cell
+	_last_tap_time = now
+
+
+# Double-tap tracking for wall-demolition marks.
+var _last_tap_cell := Vector2i(-1, -1)
+var _last_tap_time := 0.0
+
+
+## Toggles the red X on a wall hex and tells the main screen. The dots do
+## the actual tearing down - the X disappears when the wall falls.
+func _toggle_wall_delete(cell: Vector2i) -> void:
+	if state.delete_marked.has(cell):
+		state.delete_marked.erase(cell)
+	else:
+		state.delete_marked[cell] = true
+	markers.mark_changed()
+	var socket := _get_socket_node()
+	if socket and socket.has_method("send_building_delete"):
+		socket.send_building_delete(cell.x, cell.y, team_number)
+
+
+## A marked wall fell (the dots tore it down): drop the X and repaint.
+func notify_wall_deleted(col: int, row: int) -> void:
+	var cell := Vector2i(col, row)
+	state.delete_marked.erase(cell)
+	markers.mark_changed()
 
 
 func _on_building_picked(building_id: int) -> void:

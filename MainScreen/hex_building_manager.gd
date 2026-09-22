@@ -1,7 +1,7 @@
 extends Node3D
 class_name HexBuildingManager
 
-## Spawns 3D building meshes (castle / tower / wall) on whole hex cells when a
+## Spawns 3D building meshes (barrack / mine / wall) on whole hex cells when a
 ## phone drags one onto a hex in the hex detail view. Attach as a child of the
 ## terrain (or anywhere in the main scene) and call place_building().
 ##
@@ -9,6 +9,15 @@ class_name HexBuildingManager
 ## anymore - a building occupies the entire hex it is dropped on, is centered
 ## at that hex's center, and each hex holds at most one building (re-dropping
 ## replaces it).
+##
+## GROUNDING: every building is snapped to the terrain heightmap directly
+## (HexTile._sample_height - the exact bilinear the terrain mesh is built
+## from). get_hex_center() alone was never enough: it samples ONLY the hex's
+## center point, so on slopes part of a footprint could sink into rising
+## ground, and while the NoiseTexture2D is still generating asynchronously it
+## falls back to y = 0.0 (buildings appeared underground). Instead the
+## building's Y is the MAX heightmap sample over its footprint, plus a small
+## lift so the base never z-fights with the terrain mesh.
 
 ## World-space circumradius of one parent hex cell. The terrain's hex tiles
 ## have a pre-scale circumradius of ~hex_size (center-to-corner), scaled up
@@ -16,9 +25,16 @@ class_name HexBuildingManager
 @export var hex_size: float = 1.0
 @export var mesh_scale: float = 10.0
 
-## Assign a terrain node (hex_terrain.gd) so buildings sit on the actual
-## terrain height instead of a flat plane. Optional.
+## Assign the terrain/main-screen node so buildings sit on the actual terrain
+## height instead of a flat plane. Optional.
 @export var terrain_path: NodePath
+## Node that owns the heightmap NoiseTexture2D (`heightmap_image` property)
+## and `height_scale` - usually the same node as terrain_path. Optional; when
+## unset the terrain node is probed for the same properties.
+@export var heightmap_path: NodePath
+## Fallback height scale for heightmap sampling when the source node doesn't
+## expose one. Must match the terrain's height_scale to sit on its surface.
+@export var height_scale: float = 10.0
 
 # Building ids - must match BuildingTypes on the phone and sim.glsl's ids.
 const BUILDING_BARRACK := 0
@@ -27,8 +43,8 @@ const BUILDING_WALL := 2
 
 ## Footprint of each building as a fraction of the PARENT hex circumradius.
 ## All buildings live inside their hex (whole-hex placement), so these stay
-## <= 1.0: a wall is a low fat disc filling most of the hex, the barrack is
-## a mid-size squat house, the mine is a low wide pit.
+## <= 1.0: a wall is a low fat hex prism filling most of the hex, the barrack
+## a round mid-size tower, the mine a low triangular prism.
 const BUILDING_HEX_FRACTION := {
 	BUILDING_WALL: 0.85,
 	BUILDING_BARRACK: 0.62,
@@ -45,7 +61,16 @@ const BUILDING_HEIGHT_FRAC := {
 ## Global size dial: multiplies footprint radius and height.
 @export_range(0.1, 2.0) var size_multiplier := 0.75
 
+## Neutral tint for ownerless (built-but-uncaptured) mines.
+const NEUTRAL_COLOR := Color(0.6, 0.6, 0.62)
+
 var _terrain: Node = null
+## Node probed for heightmap_image / height_scale (heightmap_path target).
+var _heightmap_source: Node = null
+## Cached heightmap image. NoiseTexture2D generates asynchronously, so
+## get_image() returns null until it's ready - we keep the first non-null
+## result and use it for every later placement.
+var _heightmap_img: Image = null
 
 ## Building per hex, for dedup/replace: Vector2i(col,row) -> Node3D
 var _hex_buildings: Dictionary = {}
@@ -54,6 +79,60 @@ var _hex_buildings: Dictionary = {}
 func _ready() -> void:
 	if terrain_path != NodePath():
 		_terrain = get_node_or_null(terrain_path)
+	if heightmap_path != NodePath():
+		_heightmap_source = get_node_or_null(heightmap_path)
+	_heightmap_img = _fetch_heightmap_image()
+
+
+## The node to read heightmap_image / height_scale from: the explicit
+## heightmap_path target if set, else the terrain node.
+func _height_source() -> Node:
+	return _heightmap_source if _heightmap_source != null else _terrain
+
+
+## Grabs the terrain's NoiseTexture2D image. Returns null while the texture
+## is still generating - callers must handle that (we cache once it exists).
+func _fetch_heightmap_image() -> Image:
+	var src := _height_source()
+	if src == null:
+		return null
+	var tex: Variant = src.get("heightmap_image")
+	if tex is NoiseTexture2D:
+		return tex.get_image()
+	return null
+
+
+## The height scale that matches the terrain's sampling (the terrain node's
+## own height_scale when it exposes one, else our fallback export).
+func _active_height_scale() -> float:
+	var src := _height_source()
+	if src != null:
+		var hs: Variant = src.get("height_scale")
+		if hs is float:
+			return hs
+	return height_scale
+
+
+## Terrain height under a building footprint: the MAX of the heightmap
+## sample at the center and at four points offset by the footprint radius.
+## Max (not just the center) so a building straddling a slope never has part
+## of its base buried in rising ground. A small lift keeps the base just
+## above the surface so it never z-fights with the terrain mesh.
+func _ground_y(world_x: float, world_z: float, footprint_radius: float) -> float:
+	var img := _heightmap_img
+	if img == null:
+		img = _fetch_heightmap_image()
+		_heightmap_img = img
+	if img == null:
+		return 0.0
+	var hs := _active_height_scale()
+	var inv_scale := 1.0 / maxf(mesh_scale, 0.001)
+	var best := -INF
+	for off in [Vector2.ZERO, Vector2.RIGHT, Vector2.LEFT, Vector2.DOWN, Vector2.UP]:
+		var x = world_x + off.x * footprint_radius
+		var z = world_z + off.y * footprint_radius
+		best = maxf(best, HexTile._sample_height(img, img.get_width(), img.get_height(), x * inv_scale, z * inv_scale, hs))
+	return best + footprint_radius * 0.03
 
 
 ## World-space circumradius of a parent hex.
@@ -61,9 +140,14 @@ func _hex_world_radius() -> float:
 	return hex_size * mesh_scale
 
 
+## Footprint radius of one building type in world units.
+func _footprint_radius(building_id: int) -> float:
+	return _hex_world_radius() * float(BUILDING_HEX_FRACTION.get(building_id, 0.8)) * size_multiplier
+
+
 ## Place (or replace) the building that occupies hex (col, row) as a whole.
-## building_id: 0 = barrack, 1 = mine, 2 = wall. The prism is centered on
-## the hex's center point - not a sub-hex position.
+## building_id: 0 = barrack, 1 = mine, 2 = wall. The mesh is centered on the
+## hex's center point and snapped to the terrain heightmap.
 ## `built`: false = construction site - spawns as a small translucent ghost;
 ## call set_built() on the returned node once boids finish building it and
 ## the mesh grows to full size.
@@ -78,14 +162,13 @@ func place_building(col: int, row: int, building_id: int, team: int, built: bool
 	if _terrain and _terrain.has_method("get_hex_center"):
 		center = _terrain.get_hex_center(col, row)
 	var building := _make_building_mesh(building_id, team, built)
-	building.position = center
+	# Y comes from the heightmap, NOT get_hex_center(): the single center
+	# sample ignores the footprint's reach (buildings sank into slopes), and
+	# it returns 0.0 while the heightmap texture is still generating.
+	building.position = Vector3(center.x, _ground_y(center.x, center.z, _footprint_radius(building_id)), center.z)
 	add_child(building)
 	_hex_buildings[hex_key] = building
 	return building
-
-
-## Neutral tint for ownerless (built-but-uncaptured) mines.
-const NEUTRAL_COLOR := Color(0.6, 0.6, 0.62)
 
 
 ## Remove the building inside one hex (e.g. when the hex is destroyed).
@@ -98,31 +181,21 @@ func clear_hex(col: int, row: int) -> void:
 
 # ---- mesh construction -------------------------------------------------------
 
-## Every building is a 6-sided prism (a big hex) whose circumradius is
-## BUILDING_HEX_FRACTION[id] of the PARENT hex radius, centered on the hex -
-## so each building visually "is" its hexagon.
+## Every building is a vertical prism centered on its hex, whose circumradius
+## is BUILDING_HEX_FRACTION[id] of the PARENT hex radius, so the shape fits
+## inside its hexagon: the WALL is a 6-sided hexagonal prism, the BARRACK a
+## smooth circle (32-segment cylinder), the MINE a triangle (3-segment
+## cylinder = vertical triangular prism, flat face resting on the ground).
 func _make_building_mesh(building_id: int, team: int, built: bool = true) -> Node3D:
 	var root := Node3D.new()
 
-	var hex_r := _hex_world_radius()
-	var radius: float = hex_r * float(BUILDING_HEX_FRACTION.get(building_id, 0.8)) * size_multiplier
-	var height: float = hex_r * float(BUILDING_HEIGHT_FRAC.get(building_id, 0.3)) * size_multiplier
+	var radius: float = _footprint_radius(building_id)
+	var height: float = _hex_world_radius() * float(BUILDING_HEIGHT_FRAC.get(building_id, 0.3)) * size_multiplier
 
-	var base_color: Color
-	match building_id:
-		BUILDING_BARRACK:
-			base_color = Color(0.85, 0.45, 0.15) # rust orange
-		BUILDING_MINE:
-			base_color = Color(0.55, 0.3, 0.75)  # deep purple
-		_:
-			base_color = Color(0.55, 0.4, 0.3)   # brown (wall)
-
-	# Team tint blended into the building color so ownership is visible.
-	# team < 0 = neutral (ownerless mine): no tint, plain gray.
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = base_color if team < 0 else base_color.lerp(_team_color(team), 0.35)
-	if team < 0:
-		mat.albedo_color = base_color.lerp(NEUTRAL_COLOR, 0.85)
+	# Owned buildings wear their team's FULL color (same palette as the
+	# dots). team < 0 = ownerless (uncaptured mine): plain gray.
+	mat.albedo_color = NEUTRAL_COLOR if team < 0 else _team_color(team)
 	mat.roughness = 0.8
 
 	# Construction site: tiny translucent ghost at ground level. set_built()
@@ -133,10 +206,16 @@ func _make_building_mesh(building_id: int, team: int, built: bool = true) -> Nod
 		height *= 0.15
 
 	var cyl := CylinderMesh.new()
+	match building_id:
+		BUILDING_MINE:
+			cyl.radial_segments = 3   # triangle
+		BUILDING_WALL:
+			cyl.radial_segments = 6   # hex prism
+		_:
+			cyl.radial_segments = 32  # smooth circle
 	cyl.top_radius = radius
 	cyl.bottom_radius = radius
 	cyl.height = height
-	cyl.radial_segments = 6
 	cyl.rings = 1
 
 	var mi := MeshInstance3D.new()
@@ -173,6 +252,8 @@ func set_built(building: Node3D, builders: int = 1) -> void:
 	# who placed it. Every other building keeps its placing team's color.
 	var use_team := -1 if bid == BUILDING_MINE else team
 	var full := _make_building_mesh(bid, use_team, true)
+	# The ghost was already heightmap-grounded in place_building(); the full
+	# mesh keeps exactly that position.
 	full.position = pos
 	parent.add_child(full)
 	# Grow-in: start small and tween to full scale. More builders = faster.
@@ -199,17 +280,8 @@ func recolor_building_at(hex_key: Vector2i, team: int) -> void:
 	if not is_instance_valid(building):
 		return
 	building.set_meta("team", team)
-	var bid: int = building.get_meta("building_id", 0)
 	var mat := StandardMaterial3D.new()
-	var base_color: Color
-	match bid:
-		BUILDING_BARRACK:
-			base_color = Color(0.85, 0.45, 0.15)
-		BUILDING_MINE:
-			base_color = Color(0.55, 0.3, 0.75)
-		_:
-			base_color = Color(0.55, 0.4, 0.3)
-	mat.albedo_color = base_color.lerp(_team_color(team), 0.75)
+	mat.albedo_color = NEUTRAL_COLOR if team < 0 else _team_color(team)
 	mat.roughness = 0.8
 	building.get_child(0).material_override = mat
 

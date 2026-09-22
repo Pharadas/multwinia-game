@@ -50,16 +50,21 @@ struct CellInfo {
 layout(set=0, binding=5, std430) buffer CellInfoBuf { CellInfo cells[]; } cell_info;
 
 #define BUILDING_BUILT_BIT 0x80000000u
-// Build progress lives in the packed building word's SPARE bits (16-30): a
-// 15-bit counter of builder-frames accumulated on the site. 15 bits is
+// Build progress lives in the packed building word's SPARE bits (16-29): a
+// 14-bit counter of builder-frames accumulated on the site. 14 bits is
 // what lets walls take 10x the work of other buildings (600 > 255, the
 // old byte-wide counter would have overflowed into neighboring fields).
-// Bit 31 stays the BUILT flag; overflow past 32767 is impossible (the
-// counter flips the built flag long before that).
+// Bit 31 stays the BUILT flag; bit 30 is the DEMOLITION mark (see
+// DELETE_MARK_BIT below); overflow past 16383 is impossible (the counter
+// flips the built flag long before that).
 #define BUILD_PROGRESS_SHIFT 16u
-#define BUILD_PROGRESS_MASK 0x7FFF0000u
+#define BUILD_PROGRESS_MASK 0x3FFF0000u
 #define BUILD_WORK 200u        // builder-frames for most buildings (~3.3s, 1 builder)
 #define WALL_BUILD_WORK 600u   // walls take ~10s for a single builder (60fps)
+// Wall demolition: bit 30 marks a wall "to be torn down" (phone double-tap
+// on it). Dots near a marked wall strip its build-progress counter; at
+// zero the wall's word is wiped and the CPU removes the mesh + hex.
+#define DELETE_MARK_BIT 0x40000000u
 
 uint cell_building_id(uint packed_info)  { return packed_info & 0xFFu; }
 uint cell_building_team(uint packed_info){ return (packed_info >> 8u) & 0xFFu; }
@@ -1050,7 +1055,7 @@ void main() {
                 ? WALL_BUILD_WORK : BUILD_WORK;
             uint old_packed = atomicAdd(cell_info.cells[cell_index_2d(0, site_cell, dims)].building,
                                         1u << BUILD_PROGRESS_SHIFT);
-            uint prog = ((old_packed >> BUILD_PROGRESS_SHIFT) & 0x7FFFu) + 1u;
+            uint prog = ((old_packed >> BUILD_PROGRESS_SHIFT) & 0x3FFFu) + 1u;
             if (prog >= work_needed) {
                 // We pushed progress to full - flip built (idempotent; also
                 // clamps any overflow garbage back out of the progress field).
@@ -1066,6 +1071,42 @@ void main() {
         }
     } else {
         state &= ~STATE_BUILDING;
+    }
+
+    // --- DEMOLITION: marked walls get torn down by nearby dots ---
+    // A wall marked for demolition (phone double-tap) carries bit 30. ANY
+    // live dot within 1 cell of any covered grid cell chips it: every frame
+    // each dot strips one build-progress unit. The built-flip zeroes the
+    // progress field, so the first chip seeds full demolition HP; when the
+    // counter hits zero the word is wiped to empty (0xFF) and the CPU poll
+    // removes the mesh and destroys the hex. Chipping happens in passing -
+    // no marching, no standing still, no seat logic.
+    {
+        for (int ddx = -1; ddx <= 1; ddx++) {
+            for (int ddz = -1; ddz <= 1; ddz++) {
+                ivec3 dc = my_cell + ivec3(ddx, 0, ddz);
+                if (dc.x < 0 || dc.x >= dims.x || dc.z < 0 || dc.z >= dims.z) continue;
+                uint dci = cell_index_2d(0, dc, dims);
+                uint packed_w = cell_info.cells[dci].building;
+                if (cell_building_id(packed_w) != BUILDING_WALL) continue;
+                if (!cell_building_is_built(packed_w)) continue;
+                if ((packed_w & DELETE_MARK_BIT) == 0u) continue;
+                uint prog = (packed_w >> BUILD_PROGRESS_SHIFT) & 0x3FFFu;
+                if (prog == 0u) {
+                    // First chip: seed full demolition HP (the built-flip
+                    // cleared the progress field). Concurrent seeds write
+                    // the same value, so a plain exchange is safe.
+                    atomicExchange(cell_info.cells[dci].building,
+                        (packed_w & ~BUILD_PROGRESS_MASK) | (WALL_BUILD_WORK << BUILD_PROGRESS_SHIFT));
+                } else if (prog > 1u) {
+                    // Strip one unit: atomicAdd of -65536 (unsigned wrap).
+                    atomicAdd(cell_info.cells[dci].building, 0xFFFF0000u);
+                } else {
+                    // Fully chipped: wipe the wall out (idempotent).
+                    atomicExchange(cell_info.cells[dci].building, 0xFFu);
+                }
+            }
+        }
     }
 
     // --- SPECIAL MINER EARLY-OUT ---

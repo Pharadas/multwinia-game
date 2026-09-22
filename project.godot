@@ -11,7 +11,7 @@ config_version=5
 [application]
 
 config/name="Phone AOE"
-run/main_scene="res://MainScreen/BoidDemo.tscn"
+run/main_scene="uid://bpshkgkp0l5xx"
 config/features=PackedStringArray("4.7", "Mobile")
 
 [display]

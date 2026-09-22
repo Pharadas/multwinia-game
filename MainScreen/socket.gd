@@ -78,11 +78,31 @@ signal drawn_path_received(points: Array, team: int, fraction: float)
 ## the building occupies the entire hex, centered on it).
 signal building_placed_remote(col: int, row: int, building_id: int, team: int)
 
+## Emitted when a phone double-tapped a WALL hex: mark it for demolition -
+## nearby dots will tear it down (see sim.glsl's demolition block).
+signal wall_delete_marked(col: int, row: int, team: int)
+
 var _server := TCPServer.new()
 var _discovery_udp := PacketPeerUDP.new()
 
 ## One entry per connected phone: {"tcp": StreamPeerTCP, "peer": PacketPeerStream}.
 var _clients: Array = []
+
+## WEB PHONES: browsers can't open raw TCP sockets, so web-exported phone
+## views connect here over WebSocket instead (same messages, JSON-encoded).
+## Entries are {"ws": WebSocketPeer, "team": int}. Runs alongside the raw
+## TCP server on `websocket_port` - native phones and web phones coexist.
+@export var websocket_port: int = 9080
+var _ws_server := TCPServer.new()
+## Set false to skip UPnP (e.g. when the router has no gateway or you're
+## running pure-LAN sessions and don't want the router touched).
+@export var enable_upnp: bool = true
+## Port forwarded for OUTSIDE connections. Local phones connect over the LAN
+## regardless - UPnP only matters when a web phone is coming from the internet.
+@export var upnp_public_port: int = 4242
+var _upnp: UPNP = null
+var _upnp_external_ip := ""
+var _ws_clients: Array = []
 
 ## Cached so a phone that connects AFTER generation already finished still
 ## gets the terrain, instead of only ever seeing live pushes.
@@ -98,6 +118,13 @@ func _ready() -> void:
 	if err != OK:
 		push_error("HexTerrainSocket: couldn't listen on port %d (error %d)." % [port, err])
 
+	# WebSocket listener for web-exported phones (browsers: TCP is banned).
+	var ws_err := _ws_server.listen(websocket_port)
+	if ws_err != OK:
+		push_error("HexTerrainSocket: couldn't listen for WebSockets on port %d (error %d)." % [websocket_port, ws_err])
+	else:
+		print("HexTerrainSocket: WebSocket server listening on port %d." % websocket_port)
+
 	if enable_lan_discovery:
 		var udp_err := _discovery_udp.bind(discovery_port)
 		if udp_err != OK:
@@ -106,6 +133,39 @@ func _ready() -> void:
 			print("HexTerrainSocket: LAN discovery listening on UDP %d." % discovery_port)
 
 	_print_local_addresses()
+
+	if enable_upnp:
+		# Threaded: gateway discovery can block for several seconds - don't
+		# stall scene startup on it.
+		_upnp = UPNP.new()
+		var upnp_thread := Thread.new()
+		upnp_thread.start(_setup_upnp)
+
+
+## Opens the game ports on the router via UPnP so web phones from OUTSIDE
+## the LAN can reach this server. Only the WebSocket port strictly needs
+## forwarding (browsers connect to it); the raw TCP port is forwarded too
+## so native phones from other networks can also join.
+func _setup_upnp() -> void:
+	var err := _upnp.discover()
+	if err != UPNP.UPNP_RESULT_SUCCESS:
+		print("HexTerrainSocket: UPnP discovery failed (error %d) - web phones must connect over the LAN or via manual port forwarding." % err)
+		return
+	var gateway := _upnp.get_gateway()
+	if gateway == null or not gateway.is_valid_gateway():
+		print("HexTerrainSocket: UPnP found no valid gateway - web phones must connect over the LAN or via manual port forwarding.")
+		return
+	# Discover() must complete before any other call, and these calls are
+	# only safe from one thread - this whole function runs on the worker.
+	for fwd_port in [upnp_public_port, websocket_port]:
+		# UDP first is pointless for this game; TCP is what both transports use.
+		var tcp_err := _upnp.add_port_mapping(fwd_port, fwd_port, "hex_terrain_tcp", "TCP", 0)
+		if tcp_err != OK:
+			print("HexTerrainSocket: UPnP couldn't forward TCP %d (error %d)." % [fwd_port, tcp_err])
+		else:
+			print("HexTerrainSocket: UPnP forwarded TCP %d." % fwd_port)
+	_upnp_external_ip = _upnp.query_external_address()
+	print("HexTerrainSocket: public IP for internet web phones: %s (WS port %d)" % [_upnp_external_ip, websocket_port])
 
 
 ## Purely informational - lets you type an IP into a phone manually as a
@@ -118,6 +178,8 @@ func _print_local_addresses() -> void:
 		if addr.begins_with("127.") or addr.begins_with("169.254.") or addr == "::1":
 			continue
 		print("HexTerrainSocket: reachable at %s:%d" % [addr, port])
+	# The public (UPnP) address is printed by _setup_upnp() on its worker
+	# thread once discovery finishes - no need to block startup for it.
 
 
 func _process(_delta: float) -> void:
@@ -155,6 +217,40 @@ func _process(_delta: float) -> void:
 		while peer.get_available_packet_count() > 0:
 			_handle_message(peer.get_var(), peer)
 
+	# --- WebSocket clients (web phones) --------------------------------------
+	while _ws_server.is_connection_available():
+		var ws := WebSocketPeer.new()
+		# The terrain message is well over the 64 KB default WS buffers (Godot
+		# silently breaks above it) - match the 4 MB the TCP path uses.
+		ws.inbound_buffer_size = 4 * 1024 * 1024
+		ws.outbound_buffer_size = 4 * 1024 * 1024
+		ws.accept_stream(_ws_server.take_connection())
+		var ws_client := {"ws": ws, "team": -1}
+		_ws_clients.append(ws_client)
+		print("HexTerrainSocket: web phone connected (%d WS total)." % _ws_clients.size())
+		_assign_team(ws_client)
+
+	for i in range(_ws_clients.size() - 1, -1, -1):
+		var client: Dictionary = _ws_clients[i]
+		var ws: WebSocketPeer = client.ws
+		ws.poll()
+		var ws_state := ws.get_ready_state()
+		if ws_state == WebSocketPeer.STATE_OPEN:
+			# First OPEN after team assignment: greet now (see _assign_team).
+			if not client.get("greeted", true):
+				client["greeted"] = true
+				_peer_send(ws, {"type": "assigned_team", "team": client.team})
+			while ws.get_available_packet_count() > 0:
+				var packet := ws.get_packet()
+				if ws.was_string_packet():
+					var parsed: Variant = JSON.parse_string(packet.get_string_from_utf8())
+					if parsed is Dictionary:
+						_handle_message(parsed, ws)
+				# (binary WS packets ignored - phones always send text JSON)
+		elif ws_state == WebSocketPeer.STATE_CLOSED:
+			_ws_clients.remove_at(i)
+			print("HexTerrainSocket: web phone disconnected (team %d freed, %d WS remaining)." % [client.team, _ws_clients.size()])
+
 
 ## Hands a newly-connected phone the next unused team number (0, 1, 2, ...
 ## up to max_teams - 1) and tells it directly, so nothing has to be typed
@@ -171,7 +267,15 @@ func _assign_team(client: Dictionary) -> void:
 	for team in range(max_teams):
 		if not used.has(team):
 			client.team = team
-			client.peer.put_var({"type": "assigned_team", "team": team})
+			if client.has("ws"):
+				# Web phone: the WebSocket handshake is still in progress at
+				# accept time (accept_stream only STARTS it), so sending now
+				# would be silently dropped. The greeting is deferred to the
+				# moment the peer first reports STATE_OPEN in _process().
+				client["greeted"] = false
+			else:
+				# Native phone: put_var buffers fine on an accepted TCP stream.
+				_peer_send(client.peer, {"type": "assigned_team", "team": team})
 			print("HexTerrainSocket: assigned team %d to new phone." % team)
 			player_joined.emit(team)
 			return
@@ -193,11 +297,13 @@ func _poll_discovery() -> void:
 			continue
 
 		_discovery_udp.set_dest_address(sender_ip, sender_port)
-		_discovery_udp.put_packet(("%s%d" % [DISCOVERY_REPLY_PREFIX, port]).to_utf8_buffer())
+		_discovery_udp.put_packet(("%s%d:%d" % [DISCOVERY_REPLY_PREFIX, port, websocket_port]).to_utf8_buffer())
 		print("HexTerrainSocket: answered discovery request from %s:%d." % [sender_ip, sender_port])
 
 
-func _handle_message(msg, from_peer: PacketPeerStream) -> void:
+## `from_peer` is either a PacketPeerStream (native phone) or a
+## WebSocketPeer (web phone) - whichever transport the message arrived on.
+func _handle_message(msg, from_peer) -> void:
 	if typeof(msg) != TYPE_DICTIONARY or not msg.has("type"):
 		return
 
@@ -206,12 +312,18 @@ func _handle_message(msg, from_peer: PacketPeerStream) -> void:
 		if client.peer == from_peer:
 			sender_team = client.team
 			break
+	if sender_team == -1:
+		# Not a native client - check the web (WebSocket) phones too.
+		for client in _ws_clients:
+			if client.ws == from_peer:
+				sender_team = client.team
+				break
 
 	match msg.type:
 		"request_terrain":
 			# Reply only to whoever asked - a phone joining late shouldn't
 			# make every other phone's terrain get re-sent too.
-			from_peer.put_var({"type": "terrain", "tiles": _last_tiles})
+			_peer_send(from_peer, {"type": "terrain", "tiles": _last_tiles})
 
 		"tile_clicked":
 			var col: int = msg.col
@@ -237,6 +349,12 @@ func _handle_message(msg, from_peer: PacketPeerStream) -> void:
 			var team_number: int = sender_team if sender_team != -1 else msg.get("team", 0)
 			building_placed_remote.emit(col, row, building_id, team_number)
 
+		"building_delete":
+			var dcol: int = msg.col
+			var drow: int = msg.row
+			var dteam: int = sender_team if sender_team != -1 else msg.get("team", 0)
+			wall_delete_marked.emit(dcol, drow, dteam)
+
 
 func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array) -> Array:
 	var terrain := _get_terrain()
@@ -248,9 +366,9 @@ func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array
 		var c1: Vector2i = ref_cells[1]
 		var c2: Vector2i = ref_cells[2]
 
-		var l0: Vector2 = ref_locals[0] if ref_locals[0] is Vector2 else Vector2(ref_locals[0].x, ref_locals[0].y)
-		var l1: Vector2 = ref_locals[1] if ref_locals[1] is Vector2 else Vector2(ref_locals[1].x, ref_locals[1].y)
-		var l2: Vector2 = ref_locals[2] if ref_locals[2] is Vector2 else Vector2(ref_locals[2].x, ref_locals[2].y)
+		var l0: Vector2 = _as_vec2(ref_locals[0])
+		var l1: Vector2 = _as_vec2(ref_locals[1])
+		var l2: Vector2 = _as_vec2(ref_locals[2])
 
 		var w0_3d: Vector3 = terrain.get_hex_center(c0.x, c0.y)
 		var w1_3d: Vector3 = terrain.get_hex_center(c1.x, c1.y)
@@ -268,13 +386,27 @@ func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array
 
 		var out: Array = []
 		for pt in points:
-			var p: Vector2 = pt if pt is Vector2 else Vector2(float(pt.get("x", 0)), float(pt.get("y", 0)))
+			# Web phones ship points as JSON arrays [x, y] - native ones as
+			# Vector2 (or {x, y} dicts from older clients).
+			var p := _as_vec2(pt)
 			var wx := w0.x + (p.x - l0.x) * scale_x
 			var wz := w0.y + (p.y - l0.y) * scale_y
 			out.append(Vector2(wx, wz))
 		return out
 
 	return points
+
+
+## Robust Vector2 decode for network values: native Vector2, JSON array
+## [x, y], or a legacy {x, y} dictionary.
+func _as_vec2(v: Variant) -> Vector2:
+	if v is Vector2:
+		return v
+	if v is Array and v.size() >= 2:
+		return Vector2(float(v[0]), float(v[1]))
+	if v is Dictionary:
+		return Vector2(float(v.get("x", 0.0)), float(v.get("y", 0.0)))
+	return Vector2.ZERO
 
 
 func _get_terrain() -> Node:
@@ -287,9 +419,8 @@ func _get_terrain() -> Node:
 func _call_tile_function(col: int, row: int, team: int) -> void:
 	var terrain := _get_terrain()
 	if previously_selected_tiles.has(team):
-		var prev: HexTile = previously_selected_tiles[team]
-		if is_instance_valid(prev):
-			prev.deselect_by_team(team)
+		if (previously_selected_tiles[team]):
+			previously_selected_tiles[team].deselect_by_team(team)
 
 	if terrain and terrain.has_method("get_hex_node"):
 		var tile = terrain.get_hex_node(col, row)
@@ -298,13 +429,49 @@ func _call_tile_function(col: int, row: int, team: int) -> void:
 			previously_selected_tiles[team] = tile
 
 
+## Sends `msg` to one phone peer - either a native PacketPeerStream (put_var,
+## full Variant fidelity) or a web WebSocketPeer (JSON text). Vector2 and
+## Color get flattened explicitly so JSON never sees a raw Variant.
+func _peer_send(peer, msg: Dictionary) -> void:
+	if peer is WebSocketPeer:
+		if peer.get_ready_state() == WebSocketPeer.STATE_OPEN:
+			peer.send_text(JSON.stringify(_jsonify(msg)))
+	elif peer != null:
+		peer.put_var(msg)
+
+
+## JSON-safe conversion (mirrors HexGrid2DSocket._jsonify on the phone):
+## Vector2/Vector2i -> [x, y], Color -> {r, g, b, a}, recursive.
+func _jsonify(v: Variant) -> Variant:
+	if v is Vector2 or v is Vector2i:
+		return [v.x, v.y]
+	if v is Color:
+		return {"r": v.r, "g": v.g, "b": v.b, "a": v.a}
+	if v is Array:
+		var out: Array = []
+		out.resize(v.size())
+		for i in v.size():
+			out[i] = _jsonify(v[i])
+		return out
+	if v is Dictionary:
+		var out := {}
+		for k in v:
+			out[k] = _jsonify(v[k])
+		return out
+	return v
+
+
 ## Sends `msg` to every connected phone, optionally skipping one peer (e.g.
 ## the phone that originated the message, so it doesn't get its own echo).
-func _broadcast(msg: Dictionary, except_peer: PacketPeerStream = null) -> void:
+func _broadcast(msg: Dictionary, except_peer = null) -> void:
 	for client in _clients:
 		var peer: PacketPeerStream = client.peer
 		if peer != except_peer:
-			peer.put_var(msg)
+			_peer_send(peer, msg)
+	for client in _ws_clients:
+		var peer = client.ws
+		if peer != except_peer:
+			_peer_send(peer, msg)
 
 
 ## Pushes one team's current resource pool to every connected phone so the
@@ -327,3 +494,8 @@ func send_terrain(tiles: Array) -> void:
 ## map and advance its mining frontier one ring inward.
 func broadcast_hex_destroyed(col: int, row: int) -> void:
 	_broadcast({"type": "hex_destroyed", "col": col, "row": row})
+
+## A wall marked for demolition has been torn down by the dots: tell every
+## phone so the red X comes off the map.
+func broadcast_wall_deleted(col: int, row: int) -> void:
+	_broadcast({"type": "wall_deleted", "col": col, "row": row})
