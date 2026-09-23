@@ -17,6 +17,9 @@ var _input: LineEdit
 var _connect_btn: Button
 var _spinner_time := 0.0
 var _visible_connected := false
+## Non-empty = show this exact message instead of the animated
+## "connecting..." spinner (e.g. "nothing dialable yet" or "trying wss://...").
+var _status_override := ""
 
 func _ready() -> void:
 	layer = 50
@@ -47,7 +50,7 @@ func _build_ui() -> void:
 	box.add_child(title)
 
 	var hint := Label.new()
-	hint.text = "Enter the host's IP (e.g. 203.0.113.7),\nIP:port, or a full ws:// address."
+	hint.text = "Enter the host's IP (e.g. 203.0.113.7), IP:port,\nor a full ws:// or wss:// address.\nPages hosted on HTTPS (itch.io, github.io)\nmust use a wss:// address."
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_color_override("font_color", Color(1, 1, 1, 0.55))
 	box.add_child(hint)
@@ -74,21 +77,33 @@ func _on_text_submitted(_t: String) -> void:
 	_try_connect()
 
 func _process(delta: float) -> void:
-	if visible:
-		_spinner_time += delta
-		var dots := ".".repeat(1 + int(_spinner_time * 2.0) % 3)
-		var state_txt := "connecting%s" % dots
-		if not _visible_connected:
-			_status.text = state_txt
+	if not visible:
+		return
+	_spinner_time += delta
+	if not _status_override.is_empty():
+		return # a fixed message is more useful than the spinner right now
+	var dots := ".".repeat(1 + int(_spinner_time * 2.0) % 3)
+	_status.text = "connecting%s" % dots
 
 ## Show while disconnected, hide once connected. Re-shows if the link drops.
 func set_connection_state(connected: bool) -> void:
 	_visible_connected = connected
 	visible = not connected
 	if connected:
+		_status_override = ""
 		_status.text = ""
+		if _input:
+			_input.release_focus()
+	elif _input:
+		# The whole point of this screen is typing an address, so put the
+		# caret in the field right away - the player never has to tap it
+		# first (and a desktop player can just start typing).
+		_input.grab_focus()
 
+## Replaces the animated spinner with a fixed message (call with "" to go
+## back to the spinner).
 func set_status(msg: String) -> void:
+	_status_override = msg
 	_status.text = msg
 
 func _try_connect() -> void:
@@ -96,5 +111,5 @@ func _try_connect() -> void:
 	if target.is_empty():
 		set_status("type an address first")
 		return
+	set_status("")
 	connect_requested.emit(target)
-	set_status("dialing %s ..." % target)

@@ -25,6 +25,9 @@ const PATH_LINE_COLOR := Color(1.0, 0.3, 0.3, 0.6)
 ## Preloaded so the facade never depends on the global class cache having
 ## scanned connect_screen.gd (fresh files aren't in it until a rescan).
 const ConnectScreenScript := preload("res://Phone/connect_screen.gd")
+## Same reason as ConnectScreenScript: a brand-new class file isn't in the
+## global class cache until the next scan, so preload it by path.
+const SpawnPickLayerScript := preload("res://Phone/spawn_pick_layer.gd")
 
 @export var terrain_path: NodePath
 @export var socket_path: NodePath
@@ -49,6 +52,7 @@ var frontier := FrontierRing.new()
 var populator: MapPopulator
 var input: PhoneInputController
 var palette: BuildingPalette
+var spawn_marks: Node2D
 var radial_menu: BuildRadialMenu
 var charge_meter: ChargeMeterView
 var connect_screen
@@ -58,7 +62,21 @@ var count_labels: CountLabelLayer
 
 # --- session ---------------------------------------------------------------
 var team_number: int = 0
+## This team's color, as sent by the main screen when it assigned the team
+## (see the socket's team_assigned). Drives the HUD's team badge, so the
+## player can tell which army they command at a glance.
+var team_color := Color(0.75, 0.75, 0.78)
 var grid_alive := false  # a terrain has been populated at least once
+
+# --- lobby spawn picking ---------------------------------------------------
+## True until the main screen starts the match (see lobby_state_received).
+## While it is true, tapping a hex picks where the army starts instead of
+## the normal tile click, and the HUD shows the picker banner.
+var in_lobby := false
+## The hexes this player picked, in pick order - the army is divided between
+## them in that order (the first pick takes the largest share).
+var spawn_picks: Array = []
+const MAX_SPAWN_PICKS := 3
 
 var _terrain: Node = null
 var _sent_paths: Array[Line2D] = []
@@ -114,6 +132,12 @@ func _build_components() -> void:
 	markers.delete_marked = state.delete_marked
 	tile_map_layer.add_child(markers)
 
+	# Spawn picks (lobby only) live above the tile map like the markers do,
+	# so they inherit the grid transform and follow every resize.
+	spawn_marks = SpawnPickLayerScript.new()
+	spawn_marks.color = team_color
+	tile_map_layer.add_child(spawn_marks)
+
 	count_labels = CountLabelLayer.new()
 	count_labels.set_enabled(show_darwinian_counts)
 	tile_map_layer.add_child(count_labels)
@@ -141,10 +165,23 @@ func _connect_socket() -> void:
 	var socket := _get_socket_node()
 	if socket and socket.has_signal("team_resources_received"):
 		socket.team_resources_received.connect(_on_team_resources_received)
+	if socket and socket.has_signal("team_assigned"):
+		socket.team_assigned.connect(_on_team_assigned)
+	if socket and socket.has_signal("lobby_state_received"):
+		socket.lobby_state_received.connect(_on_lobby_state_received)
+	# The manual-connect screen is a WEB-only fallback: native phones find the
+	# server themselves over UDP LAN discovery, and is_web_connected() is
+	# always false off the web, so showing it there would cover the map
+	# permanently with no way to dismiss it.
+	if not OS.has_feature("web"):
+		if connect_screen:
+			connect_screen.visible = false
+		return
 	if socket and socket.has_signal("connection_state_changed"):
 		socket.connection_state_changed.connect(_on_connection_state_changed)
-		# Initial state: web builds start disconnected, so show the screen.
-		_on_connection_state_changed(socket.is_web_connected() if socket.has_method("is_web_connected") else false)
+		# Initial state: a web page always starts disconnected, so show it.
+		_on_connection_state_changed(
+				socket.is_web_connected() if socket.has_method("is_web_connected") else false)
 	if socket and connect_screen and not connect_screen.connect_requested.is_connected(_on_connect_requested):
 		connect_screen.connect_requested.connect(_on_connect_requested)
 
@@ -154,9 +191,22 @@ func _on_connect_requested(target: String) -> void:
 	if socket and socket.has_method("set_remote_target"):
 		socket.set_remote_target(target)
 
+## Web only: show the overlay while the WebSocket is down, and say what is
+## being dialed (or that nothing is dialable yet, which is the normal state
+## of a page hosted on an HTTPS CDN until the player types an address).
 func _on_connection_state_changed(connected: bool) -> void:
-	if connect_screen:
-		connect_screen.set_connection_state(connected)
+	if connect_screen == null or not OS.has_feature("web"):
+		return
+	connect_screen.set_connection_state(connected)
+	if connected:
+		return
+	var socket := _get_socket_node()
+	var url := (str(socket.get_current_ws_url())
+			if socket and socket.has_method("get_current_ws_url") else "")
+	if url.is_empty():
+		connect_screen.set_status("Enter the game host's address to connect.")
+	else:
+		connect_screen.set_status("trying %s ..." % url)
 
 
 # --- terrain / network data ---------------------------------------------------
@@ -287,6 +337,11 @@ func _can_remove_at(cell: Vector2i) -> bool:
 
 func _on_cell_tapped(cell: Vector2i) -> void:
 	charge_meter.hide_meter()
+	# Lobby: a tap picks a spawn hex for this army instead of selecting the
+	# tile - the match hasn't started, so there is nothing to order yet.
+	if in_lobby:
+		toggle_spawn_pick(cell)
+		return
 	# A tap selects the hex: same-process tile call + network broadcast.
 	# (A tap is also the first half of the double-tap that arms the build
 	# menu - see PhoneInputController.)
@@ -380,6 +435,65 @@ func _place_building(cell: Vector2i, building_id: int) -> void:
 
 
 # --- network push ---------------------------------------------------------------
+
+
+## The main screen told us which team we command, and what color it is: show
+## it on the HUD (the team badge) and keep the facade's copy in sync, since
+## orders are tagged with it and the resource HUD filters broadcasts by it.
+func _on_team_assigned(team: int, color: Color) -> void:
+	team_number = team
+	team_color = color
+	if palette:
+		palette.set_team(team, color)
+	if spawn_marks:
+		spawn_marks.color = color
+		spawn_marks.mark_changed()
+
+
+# --- lobby spawn picking ----------------------------------------------------
+
+
+## The main screen's lobby state: whether the match has started, which hexes
+## THIS phone has picked, and how many each team has picked. Until the match
+## starts, taps choose spawn hexes (see _on_cell_tapped).
+func _on_lobby_state_received(started: bool, hexes: Array, _picked: Array) -> void:
+	in_lobby = not started
+	spawn_picks = []
+	if not started:
+		for h in hexes:
+			if h is Array and (h as Array).size() >= 2:
+				spawn_picks.append(Vector2i(int(h[0]), int(h[1])))
+	_apply_lobby_ui()
+
+
+## Adds/removes one spawn hex and tells the main screen about the new set.
+## Returns true when the picks actually changed. Refuses wall hexes (an army
+## spawned inside a wall would be stuck) and a fourth pick, and picking a hex
+## that is already chosen removes it.
+func toggle_spawn_pick(cell: Vector2i) -> bool:
+	if not in_lobby or state.is_wall_at(cell):
+		return false
+	if spawn_picks.has(cell):
+		spawn_picks.erase(cell)
+	elif spawn_picks.size() >= MAX_SPAWN_PICKS:
+		return false
+	else:
+		spawn_picks.append(cell)
+	_apply_lobby_ui()
+	var socket := _get_socket_node()
+	if socket and socket.has_method("send_spawn_hexes"):
+		socket.send_spawn_hexes(spawn_picks, team_number)
+	return true
+
+
+func _apply_lobby_ui() -> void:
+	if palette:
+		palette.set_lobby_picking(in_lobby, spawn_picks.size(), MAX_SPAWN_PICKS)
+	if spawn_marks:
+		spawn_marks.picks = [] if not in_lobby else spawn_picks.duplicate()
+		spawn_marks.color = team_color
+		spawn_marks.mark_changed()
+
 
 func _on_team_resources_received(team: int, amount: float) -> void:
 	if team != team_number:

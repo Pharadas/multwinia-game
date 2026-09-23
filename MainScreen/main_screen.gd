@@ -84,6 +84,21 @@ var _team_swarms: Dictionary = {}
 const DROP_INTERVAL := 45.0
 var _drop_timer := 0.0
 
+## Lobby: which teams currently have a phone connected, and the overlay that
+## lists them. The match does NOT simulate until the host starts it (see the
+## Start button / Enter key below), so players can join without the clock,
+## the economy or the map moving on without them.
+var _joined_teams: Dictionary = {}   # team -> true
+var _match_started: bool = false
+## Spawn picks per team: team -> Array[Vector2i] of TERRAIN grid cells, in
+## the order the player picked them (the first pick takes the largest share
+## of the army). Validated here, forwarded to the sim as world positions.
+var _team_spawn_picks: Dictionary = {}
+var _lobby: CanvasLayer = null
+var _lobby_list: VBoxContainer = null
+var _lobby_status: Label = null
+var _lobby_start_button: Button = null
+
 ## One walled corner base per team, computed dynamically from the ACTUAL
 ## grid size (see _compute_team_bases()) so the bases are always in the four
 ## corners of the map, whatever grid_width/grid_depth are. Each is a
@@ -122,6 +137,16 @@ func _ready() -> void:
 		socket.building_placed_remote.connect(_on_building_placed_remote)
 	if socket and socket.has_signal("wall_delete_marked"):
 		socket.wall_delete_marked.connect(_on_wall_delete_marked)
+	if socket and socket.has_signal("player_joined"):
+		socket.player_joined.connect(_on_player_joined)
+	if socket and socket.has_signal("player_left"):
+		socket.player_left.connect(_on_player_left)
+	if socket and socket.has_signal("spawn_hexes_remote"):
+		socket.spawn_hexes_remote.connect(_on_spawn_hexes_remote)
+	_build_lobby()
+	# Hand the socket the initial lobby state now, so it can greet a phone that
+	# connects before anything else changes.
+	_broadcast_lobby_state()
 	# The sim node is instanced with the scene, but its script child may not
 	# exist yet during _ready - defer so the connection always lands.
 	call_deferred("_connect_sim_signals")
@@ -199,14 +224,256 @@ func _on_mine_collapsed(cell: Vector2i, world_pos: Vector2) -> void:
 		socket.broadcast_hex_destroyed(best.col, best.row)
 
 
+# ---- lobby (who has joined + when the match begins) --------------------------
+
+## A phone just joined and was handed this team: show it in the lobby, in
+## that team's color, so the host can see who is waiting before starting.
 func _on_player_joined(team: int) -> void:
-	pass
-# 	if team < 0 or team >= team_bases.size():
-# 		return
-# 	if spawned_teams.has(team):
-# 		return
-# 	spawned_teams[team] = true
-# 	_spawn_team_army(team)
+	_joined_teams[team] = true
+	_refresh_lobby()
+	# A phone that just joined (or reconnected) needs to know it's in the
+	# lobby and whether it already picked its spawn hexes.
+	_broadcast_lobby_state()
+
+
+## That phone disconnected: drop its row - the lobby only ever lists players
+## who are actually connected right now.
+func _on_player_left(team: int) -> void:
+	_joined_teams.erase(team)
+	_refresh_lobby()
+	_broadcast_lobby_state()
+
+
+## A phone picked where its army starts (lobby only). This is the authority
+## on what is allowed: wall hexes are refused here rather than on the phone,
+## so a native phone and a browser phone get exactly the same rule, and the
+## sim only ever hears about hexes that exist and are walkable.
+func _on_spawn_hexes_remote(team: int, cells: Array) -> void:
+	if _match_started:
+		return  # the army is already fighting - a late pick can't teleport it
+	var picks: Array = []
+	for c in cells:
+		if picks.size() >= 3:
+			break
+		# A native phone can send real Vector2i values; a browser phone sends
+		# [col, row] pairs through JSON. Both arrive here.
+		var cell := Vector2i(-1, -1)
+		if c is Vector2i:
+			cell = c
+		elif c is Array and (c as Array).size() >= 2:
+			cell = Vector2i(int(c[0]), int(c[1]))
+		else:
+			continue
+		var tile: HexTile = hex_nodes.get(cell)
+		if tile == null or tile.is_wall:
+			continue
+		if picks.has(cell):
+			continue
+		picks.append(cell)
+	_team_spawn_picks[team] = picks
+	var ss := _sim_node()
+	if ss and ss.has_method("set_team_spawn_hexes"):
+		var world: Array = []
+		for cell in picks:
+			var center := get_hex_center(cell.x, cell.y)
+			world.append(Vector2(center.x, center.z))
+		ss.set_team_spawn_hexes(team, world)
+	print("Lobby: team %d spawn picks = %s" % [team, str(picks)])
+	_refresh_lobby()
+	_broadcast_lobby_state()
+
+
+## Sends the lobby state (started flag + each phone's own picks) to every
+## connected phone. The lobby panel owns the picks; the socket just ships
+## them per-client, since each phone only draws its own.
+func _broadcast_lobby_state() -> void:
+	var socket := get_node_or_null("Socket")
+	if socket and socket.has_method("broadcast_lobby_state"):
+		socket.broadcast_lobby_state(_match_started, _team_spawn_picks)
+
+
+## The 3D building manager, created on first use. Kept in one place because
+## BOTH player placement and the special center mine need it.
+func _ensure_building_manager() -> Node:
+	var mgr := get_node_or_null("HexBuildingManager")
+	if mgr:
+		return mgr
+	mgr = HexBuildingManager.new()
+	mgr.name = "HexBuildingManager"
+	mgr.hex_size = hex_size
+	mgr.mesh_scale = mesh_scale
+	# ".." resolves to THIS node once the manager is added as a child -
+	# "." would resolve to the manager itself, which broke placement.
+	mgr.terrain_path = NodePath("..")
+	# Same node owns heightmap_image / height_scale, so buildings can
+	# sample the terrain height and never spawn underground.
+	mgr.heightmap_path = NodePath("..")
+	add_child(mgr)
+	return mgr
+
+
+## The 3D twin of the sim's permanent neutral center mine. The sim has always
+## spawned that mine plus its 7 guardian dots, but only in its GPU cell_info
+## buffer - with no mesh anywhere, the guards read as stray dots standing in
+## the middle of the map around nothing. Neutral owner = -1 (gray, uncaptured),
+## and once a team captures it the existing mine_owner_changed path recolors
+## this same mesh.
+func _show_special_mine_mesh(col: int, row: int) -> void:
+	var mgr := _ensure_building_manager()
+	if mgr == null or not mgr.has_method("place_building"):
+		return
+	# Building id 1 = mine (same id the sim's setup_special_mine writes).
+	var node: Node3D = mgr.place_building(col, row, 1, -1, true)
+	if node:
+		print("Special center mine mesh on hex (%d,%d) at %s - neutral (gray) until captured." % [col, row, str(node.global_position)])
+
+
+## The GPU sim instance (its script child), or null before it exists.
+func _sim_node() -> Node:
+	var node := get_node_or_null("StupidSimple")
+	if node == null or node.get_child_count() == 0:
+		return null
+	return node.get_child(0)
+
+
+## Builds the lobby overlay: a small panel listing joined teams (colored per
+## team) plus the button that actually starts the match. It stays up after
+## the start as a "who is in this match" list, minus the button.
+func _build_lobby() -> void:
+	_lobby = CanvasLayer.new()
+	_lobby.name = "Lobby"
+	_lobby.layer = 10
+	add_child(_lobby)
+
+	var anchor := MarginContainer.new()
+	anchor.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	anchor.add_theme_constant_override("margin_left", 28)
+	anchor.add_theme_constant_override("margin_top", 28)
+	_lobby.add_child(anchor)
+
+	var panel := PanelContainer.new()
+	var panel_style := StyleBoxFlat.new()
+	panel_style.bg_color = Color(0.04, 0.05, 0.08, 0.85)
+	panel_style.border_color = Color(1.0, 1.0, 1.0, 0.14)
+	panel_style.set_border_width_all(1)
+	panel_style.set_corner_radius_all(8)
+	panel_style.content_margin_left = 20.0
+	panel_style.content_margin_right = 20.0
+	panel_style.content_margin_top = 16.0
+	panel_style.content_margin_bottom = 16.0
+	panel.add_theme_stylebox_override("panel", panel_style)
+	anchor.add_child(panel)
+
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 10)
+	panel.add_child(box)
+
+	var title := Label.new()
+	title.text = "TEAMS JOINED"
+	title.add_theme_font_size_override("font_size", 22)
+	title.add_theme_color_override("font_color", Color(0.92, 0.92, 0.96))
+	box.add_child(title)
+
+	_lobby_list = VBoxContainer.new()
+	_lobby_list.add_theme_constant_override("separation", 6)
+	box.add_child(_lobby_list)
+
+	_lobby_status = Label.new()
+	_lobby_status.add_theme_font_size_override("font_size", 15)
+	_lobby_status.add_theme_color_override("font_color", Color(0.72, 0.74, 0.8))
+	box.add_child(_lobby_status)
+
+	_lobby_start_button = Button.new()
+	_lobby_start_button.text = "START MATCH"
+	_lobby_start_button.add_theme_font_size_override("font_size", 20)
+	_lobby_start_button.pressed.connect(_start_match)
+	box.add_child(_lobby_start_button)
+
+	_refresh_lobby()
+
+
+## Rebuilds the lobby's team rows from _joined_teams (teams in ascending
+## order, each shown in its team color) and updates the status line.
+func _refresh_lobby() -> void:
+	if _lobby_list == null:
+		return
+	for child in _lobby_list.get_children():
+		child.queue_free()
+
+	var teams: Array = _joined_teams.keys()
+	teams.sort()
+	if teams.is_empty():
+		var none := Label.new()
+		none.text = "no phones connected yet"
+		none.add_theme_font_size_override("font_size", 16)
+		none.add_theme_color_override("font_color", Color(0.6, 0.62, 0.68))
+		_lobby_list.add_child(none)
+	for t in teams:
+		var team := int(t)
+		var color := HexBuildingManager.team_color(team)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 10)
+		var swatch := ColorRect.new()
+		swatch.color = color
+		swatch.custom_minimum_size = Vector2(22, 22)
+		row.add_child(swatch)
+		var label := Label.new()
+		var picks: int = (_team_spawn_picks.get(team, []) as Array).size()
+		if picks > 0:
+			label.text = "Team %d  -  spawn %d/3" % [team, picks]
+		else:
+			label.text = "Team %d  -  spawn not picked" % team
+		label.add_theme_font_size_override("font_size", 18)
+		label.add_theme_color_override("font_color", color)
+		row.add_child(label)
+		_lobby_list.add_child(row)
+
+	if _lobby_status:
+		_lobby_status.text = ("match running - players can still join" if _match_started
+				else "waiting for the host: click START MATCH or press ENTER")
+	if _lobby_start_button:
+		_lobby_start_button.visible = not _match_started
+
+
+## Opens the lobby gate: the sim starts simulating from zero match time. The
+## lobby panel stays as a roster, without the start button. Every team's
+## spawn picks are pushed once more first, so the armies are standing where
+## their players chose before a single frame of simulation runs.
+func _start_match() -> void:
+	if _match_started:
+		return
+	_match_started = true
+	var ss := _sim_node()
+	_push_spawn_picks(ss)
+	if ss and ss.has_method("start_game"):
+		ss.start_game()
+		print("Lobby: match started with %d player(s) joined." % _joined_teams.size())
+	_refresh_lobby()
+	_broadcast_lobby_state()
+
+
+## Hands every team's chosen spawn hexes to the sim as world positions (the
+## sim converts them back with world_to_hex, so no coordinate space has to
+## be reimplemented here).
+func _push_spawn_picks(ss: Node) -> void:
+	if ss == null or not ss.has_method("set_team_spawn_hexes"):
+		return
+	for team in _team_spawn_picks.keys():
+		var world: Array = []
+		for cell in _team_spawn_picks[team]:
+			var center := get_hex_center(cell.x, cell.y)
+			world.append(Vector2(center.x, center.z))
+		ss.set_team_spawn_hexes(int(team), world)
+
+
+## Enter/Space starts the match before anything else gets the key, so the
+## host can begin without hunting for the button.
+func _unhandled_input(event: InputEvent) -> void:
+	if _match_started or _lobby == null:
+		return
+	if event is InputEventKey and event.pressed and not event.echo:
+		if event.keycode in [KEY_ENTER, KEY_KP_ENTER, KEY_SPACE]:
+			_start_match()
 
 
 func _on_drawn_path_received(points: Array, team: int, fraction: float = 1.0) -> void:
@@ -333,19 +600,7 @@ func _on_building_placed_remote(col: int, row: int, building_id: int, team: int)
 	if ss_pay and ss_pay.has_method("charge_building"):
 		ss_pay.charge_building(building_id, team)
 
-	var mgr := get_node_or_null("HexBuildingManager")
-	if not mgr:
-		mgr = HexBuildingManager.new()
-		mgr.name = "HexBuildingManager"
-		mgr.hex_size = hex_size
-		mgr.mesh_scale = mesh_scale
-		# ".." resolves to THIS node once the manager is added as a child -
-		# "." would resolve to the manager itself, which broke placement.
-		mgr.terrain_path = NodePath("..")
-		# Same node owns heightmap_image / height_scale, so buildings can
-		# sample the terrain height and never spawn underground.
-		mgr.heightmap_path = NodePath("..")
-		add_child(mgr)
+	var mgr := _ensure_building_manager()
 	var node: Node3D = mgr.place_building(col, row, building_id, team, false)
 
 	# Push the UNBUILT building into the GPU cell_info buffer (sim.glsl reads
@@ -422,18 +677,25 @@ func _poll_wall_deletes() -> void:
 	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
 	if ss == null or not ss.has_method("is_building_cleared"):
 		return
+	# Only a FINISHED teardown (or a hex that no longer exists) drops its
+	# entry. Removing the entry up front - the old behavior - meant the very
+	# first poll, which almost always ran before the dots had finished
+	# chipping the wall, silently cancelled the demolition: the red X stayed
+	# on the phone, the wall stayed on the map, and nothing ever retried.
 	var i := _pending_wall_deletes.size() - 1
 	while i >= 0:
 		var key: Vector2i = _pending_wall_deletes[i]
-		_pending_wall_deletes.remove_at(i)
 		i -= 1
 		if not hex_nodes.has(key):
+			# The tile is gone (e.g. a mine collapse took the hex): there is
+			# nothing left to tear down.
+			_pending_wall_deletes.erase(key)
 			continue
 		var wp := get_hex_center(key.x, key.y)
 		var cx := int(floor((wp.x - ss.WORLD_MIN.x) / ss.CELL_SIZE))
 		var cz := int(floor((wp.z - ss.WORLD_MIN.z) / ss.CELL_SIZE))
 		if not ss.is_building_cleared(cx, cz):
-			continue
+			continue  # still being chipped: keep waiting for it
 		# Teardown complete: clear the buffer fan-out (the sim only wiped the
 		# center cell) and the 3D mesh, then tell every phone.
 		if ss.has_method("clear_building_at_hex"):
@@ -444,6 +706,7 @@ func _poll_wall_deletes() -> void:
 		var socket := get_node_or_null("Socket")
 		if socket and socket.has_method("broadcast_wall_deleted"):
 			socket.broadcast_wall_deleted(key.x, key.y)
+		_pending_wall_deletes.erase(key)
 	if _pending_wall_deletes.is_empty() and _wall_delete_timer:
 		_wall_delete_timer.stop()
 
@@ -1058,6 +1321,7 @@ func _on_terrain_ready() -> void:
 		if ss.has_method("setup_special_mine"):
 			var c := get_hex_center(grid_width / 2, grid_depth / 2)
 			ss.setup_special_mine(Vector2(c.x, c.z))
+			_show_special_mine_mesh(grid_width / 2, grid_depth / 2)
 		return
 	# Fallback: per-tile writes (older sim without the bulk method).
 	if not ss.has_method("set_cell_building"):

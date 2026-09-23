@@ -106,8 +106,13 @@ layout(set=0, binding=6, std430) buffer GlobalPathsBuf {
 layout(set=0, binding=7, std430) buffer DmgWrite { uint dmg[]; } dmg_write;
 layout(set=0, binding=8, std430) buffer DmgRead { uint dmg[]; } dmg_read;
 
-// Per-team economy, CPU-managed: [t*2+0] = resources, [t*2+1] = starve flag
-// (1 = the team couldn't pay upkeep - its boids slowly lose health).
+// Per-team economy, CPU-managed, THREE words per team (the CPU writes all
+// of them from _economy_tick):
+//   [t*3+0] = unused (zero)
+//   [t*3+1] = starve flag (1 = the team couldn't pay upkeep - its boids
+//             slowly lose health)
+//   [t*3+2] = cumulative resource debt as a float (0 = solvent). Scales the
+//             desertion chance below.
 layout(set=0, binding=9, std430) buffer EconResBuf { uint econ_res[]; } econ_res;
 
 // Per grid cell (xz, no team slices): 1 = the ground tile here collapsed

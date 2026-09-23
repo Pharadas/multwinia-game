@@ -5,3 +5,6 @@
 *.apk
 *.exe
 *.zip
+# Python bytecode from the Tests/ helper scripts
+__pycache__/
+*.pyc

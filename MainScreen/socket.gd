@@ -24,7 +24,9 @@ class_name HexTerrainSocket
 ## UDP discovery messages are plain ASCII strings, not Variants, since they
 ## need to be understood before any Godot-specific handshake happens:
 ##   <- in:  "HEX_TERRAIN_DISCOVER"
-##   -> out: "HEX_TERRAIN_HERE:<tcp_port>"
+##   -> out: "HEX_TERRAIN_HERE:<tcp_port>:<websocket_port>"
+## (the second field is optional to older phones - they still read the TCP
+## port as the first field: see HexGrid2DSocket.parse_discovery_reply)
 
 ## Port to listen on for the real game traffic. Must match every phone's
 ## HexGrid2DSocket.port.
@@ -69,7 +71,11 @@ const DISCOVERY_REPLY_PREFIX := "HEX_TERRAIN_HERE:"
 signal tile_clicked_remote(col: int, row: int)
 
 ## Emitted whenever a new phone connects and is assigned a team number.
+## A phone connected and was handed a team (see _assign_team).
 signal player_joined(team: int)
+## A phone disconnected: its team is free again. Sent so the main screen's
+## lobby can drop the row instead of listing players who already left.
+signal player_left(team: int)
 
 ## Emitted when a phone sends a free-drawn path (simplified to 16 points).
 signal drawn_path_received(points: Array, team: int, fraction: float)
@@ -82,8 +88,18 @@ signal building_placed_remote(col: int, row: int, building_id: int, team: int)
 ## nearby dots will tear it down (see sim.glsl's demolition block).
 signal wall_delete_marked(col: int, row: int, team: int)
 
+## Emitted when a phone picks the hexes its army starts in (lobby only).
+## `cells` are the phone's own grid cells - main_screen maps them to world
+## positions and is the authority on whether each one is placeable.
+signal spawn_hexes_remote(team: int, cells: Array)
+
 var _server := TCPServer.new()
 var _discovery_udp := PacketPeerUDP.new()
+
+## Latest lobby state, replayed to every phone as it finishes connecting (see
+## broadcast_lobby_state).
+var _lobby_started := true
+var _lobby_picks: Dictionary = {}
 
 ## One entry per connected phone: {"tcp": StreamPeerTCP, "peer": PacketPeerStream}.
 var _clients: Array = []
@@ -212,6 +228,8 @@ func _process(_delta: float) -> void:
 			# up, since availability there is worked out fresh from
 			# whichever clients are still in _clients at that moment.
 			print("HexTerrainSocket: phone disconnected (team %d freed, %d remaining)." % [client.team, _clients.size()])
+			if client.team >= 0:
+				player_left.emit(client.team)
 			continue
 
 		while peer.get_available_packet_count() > 0:
@@ -239,7 +257,11 @@ func _process(_delta: float) -> void:
 			# First OPEN after team assignment: greet now (see _assign_team).
 			if not client.get("greeted", true):
 				client["greeted"] = true
-				_peer_send(ws, {"type": "assigned_team", "team": client.team})
+				_peer_send(ws, assigned_team_message(client.team))
+				# What the join-time broadcast couldn't deliver (the handshake
+				# wasn't up yet): whether the lobby is open and any picks this
+				# team already made.
+				_peer_send(ws, lobby_state_message(client.team, _lobby_started, _lobby_picks))
 			while ws.get_available_packet_count() > 0:
 				var packet := ws.get_packet()
 				if ws.was_string_packet():
@@ -250,6 +272,8 @@ func _process(_delta: float) -> void:
 		elif ws_state == WebSocketPeer.STATE_CLOSED:
 			_ws_clients.remove_at(i)
 			print("HexTerrainSocket: web phone disconnected (team %d freed, %d WS remaining)." % [client.team, _ws_clients.size()])
+			if client.team >= 0:
+				player_left.emit(client.team)
 
 
 ## Hands a newly-connected phone the next unused team number (0, 1, 2, ...
@@ -258,9 +282,26 @@ func _process(_delta: float) -> void:
 ## what team it is. "Unused" is worked out fresh from every OTHER currently
 ## connected client each time, so a disconnected phone's team number
 ## naturally becomes available again for the next one to connect.
+## The message a phone gets when it joins: its team id, plus that team's
+## color so the phone can show "you are the green team" without keeping its
+## own copy of the palette. The main screen owns the palette
+## (HexBuildingManager.team_color), so a team can never be two colors there
+## and two others on the phone. Color travels as plain [r, g, b] floats - a
+## Color object cannot cross the wire.
+static func assigned_team_message(team: int) -> Dictionary:
+	var color := HexBuildingManager.team_color(team)
+	return {"type": "assigned_team", "team": team, "color": [color.r, color.g, color.b]}
+
+
 func _assign_team(client: Dictionary) -> void:
+	# BOTH transports share one pool of team numbers: a native (TCP) phone and
+	# a web (WebSocket) phone are just as likely to be in the same match, so
+	# counting only _clients here used to hand every web phone team 0.
 	var used := {}
 	for other in _clients:
+		if other != client and other.team != -1:
+			used[other.team] = true
+	for other in _ws_clients:
 		if other != client and other.team != -1:
 			used[other.team] = true
 
@@ -275,7 +316,8 @@ func _assign_team(client: Dictionary) -> void:
 				client["greeted"] = false
 			else:
 				# Native phone: put_var buffers fine on an accepted TCP stream.
-				_peer_send(client.peer, {"type": "assigned_team", "team": team})
+				_peer_send(client.peer, assigned_team_message(team))
+				_peer_send(client.peer, lobby_state_message(team, _lobby_started, _lobby_picks))
 			print("HexTerrainSocket: assigned team %d to new phone." % team)
 			player_joined.emit(team)
 			return
@@ -297,6 +339,10 @@ func _poll_discovery() -> void:
 			continue
 
 		_discovery_udp.set_dest_address(sender_ip, sender_port)
+		# Two colon-separated fields: TCP port, then the WebSocket port a web
+		# phone on the LAN would need. The phone splits them explicitly - the
+		# whole payload must NEVER be read with to_int() ("4242:9080" parses
+		# as 42429080 there, which is not a port).
 		_discovery_udp.put_packet(("%s%d:%d" % [DISCOVERY_REPLY_PREFIX, port, websocket_port]).to_utf8_buffer())
 		print("HexTerrainSocket: answered discovery request from %s:%d." % [sender_ip, sender_port])
 
@@ -354,6 +400,11 @@ func _handle_message(msg, from_peer) -> void:
 			var drow: int = msg.row
 			var dteam: int = sender_team if sender_team != -1 else msg.get("team", 0)
 			wall_delete_marked.emit(dcol, drow, dteam)
+
+		"spawn_hex":
+			var scells: Array = msg.get("cells", [])
+			var steam: int = sender_team if sender_team != -1 else int(msg.get("team", 0))
+			spawn_hexes_remote.emit(steam, scells)
 
 
 func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array) -> Array:
@@ -480,6 +531,45 @@ func _broadcast(msg: Dictionary, except_peer = null) -> void:
 ## second, so no explicit request/response handshake is needed.
 func broadcast_team_resources(team: int, amount: float) -> void:
 	_broadcast({"type": "team_resources", "team": team, "amount": amount})
+
+
+## The lobby message one phone gets: whether the match has started, which
+## hexes THIS phone picked, and how many each team has picked (so the host's
+## roster and every phone can show who is ready). Built static so
+## Tests/spawn_pick.gd can check the wire shape without a socket.
+static func lobby_state_message(team: int, started: bool, picks_by_team: Dictionary) -> Dictionary:
+	var mine: Array = []
+	for cell in picks_by_team.get(team, []):
+		mine.append([cell.x, cell.y])
+	var picked: Array = []
+	for t in picks_by_team.keys():
+		picked.append([int(t), (picks_by_team[t] as Array).size()])
+	return {
+		"type": "lobby_state",
+		"started": started,
+		"team": team,
+		"hexes": mine,
+		"picked": picked,
+	}
+
+
+## Pushes the lobby state to every phone, each getting its OWN picks (a phone
+## only ever draws its own spawn hexes). Called whenever something changes:
+## a phone joins/leaves, someone picks, and the moment the match starts.
+##
+## The latest state is CACHED, because a web phone cannot be told anything at
+## the moment it joins: its WebSocket handshake is still in flight then, so
+## the send is dropped. The greeting in _process() replays this cache to each
+## phone the first time it reports STATE_OPEN (same reason assigned_team is
+## deferred). Default is started=true: a phone is only put into spawn-picking
+## mode by an explicit lobby broadcast.
+func broadcast_lobby_state(started: bool, picks_by_team: Dictionary) -> void:
+	_lobby_started = started
+	_lobby_picks = picks_by_team
+	for client in _clients:
+		_peer_send(client.peer, lobby_state_message(client.team, started, picks_by_team))
+	for client in _ws_clients:
+		_peer_send(client.ws, lobby_state_message(client.team, started, picks_by_team))
 
 
 ## Call this once generate_terrain() finishes (or whenever the terrain

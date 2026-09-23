@@ -10,10 +10,17 @@ extends SceneTree
 var sock: Node
 var elapsed := 0.0
 var reported := {}
+## Seconds to stay up. Override with: godot -s res://Tests/websocket_smoke.gd -- 900
+var window := 180.0
 
 func _initialize() -> void:
+	var argv := OS.get_cmdline_user_args()
+	if argv.size() > 0 and argv[0].is_valid_float():
+		window = argv[0].to_float()
 	sock = load("res://MainScreen/socket.gd").new()
 	sock.name = "TestSocket"
+	# Never touch the real router from a test harness.
+	sock.enable_upnp = false
 	root.add_child(sock)
 	sock.player_joined.connect(func(t: int) -> void: print("TEST: player_joined team=", t))
 	sock.tile_clicked_remote.connect(func(c: int, r: int) -> void: print("TEST: tile_clicked_remote ", c, ",", r))
@@ -25,7 +32,7 @@ func _initialize() -> void:
 	print("TEST: terrain ready with ", tiles.size(), " tiles (pushed lazily on request via socket cache)")
 	# The socket replies from _last_tiles when a phone asks - same as the game.
 	sock.send_terrain(tiles)
-	print("TEST: harness running - open the web phone now (180 s window)")
+	print("TEST: harness running - open the web phone now (%.0f s window)" % window)
 
 func _process(delta: float) -> bool:
 	elapsed += delta
@@ -33,7 +40,7 @@ func _process(delta: float) -> bool:
 	if n_ws > 0 and not reported.has("ws"):
 		reported["ws"] = true
 		print("TEST: web client connected, ws_clients=", n_ws)
-	if elapsed >= 180.0:
+	if elapsed >= window:
 		print("TEST: done. final ws_clients=", n_ws)
 		return true
 	return false

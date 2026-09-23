@@ -12,12 +12,20 @@ class_name HexBuildingManager
 ##
 ## GROUNDING: every building is snapped to the terrain heightmap directly
 ## (HexTile._sample_height - the exact bilinear the terrain mesh is built
-## from). get_hex_center() alone was never enough: it samples ONLY the hex's
-## center point, so on slopes part of a footprint could sink into rising
-## ground, and while the NoiseTexture2D is still generating asynchronously it
-## falls back to y = 0.0 (buildings appeared underground). Instead the
-## building's Y is the MAX heightmap sample over its footprint, plus a small
-## lift so the base never z-fights with the terrain mesh.
+## from), taking the MAX over a DENSE grid across the footprint plus a small
+## lift, so the base always clears the ground it stands on:
+##   * The center alone was not enough - on a slope part of the footprint
+##     sank into rising ground.
+##   * Neither was a sparse ring (center + 4 cardinal points): this heightmap
+##     is 512 texels across a ~60-unit terrain, so a hex footprint only spans
+##     a handful of texels and a sample that misses by half a texel misses
+##     whole units of ridge. Measured on real terrain, a 5-point max put the
+##     base 2.8 units UNDER a barrack only 2.25 units tall - i.e. completely
+##     buried - while the true footprint maximum was 2.8 units higher.
+##   * The image is re-read whenever the texture regenerates (its noise seed is
+##     randomized at startup) and never cached from a previous generation:
+##     sampling a stale image places buildings against terrain that no longer
+##     exists and can miss by the full height range.
 
 ## World-space circumradius of one parent hex cell. The terrain's hex tiles
 ## have a pre-scale circumradius of ~hex_size (center-to-corner), scaled up
@@ -61,15 +69,28 @@ const BUILDING_HEIGHT_FRAC := {
 ## Global size dial: multiplies footprint radius and height.
 @export_range(0.1, 2.0) var size_multiplier := 0.75
 
+## Extra fill samples per axis across the footprint, on top of the exact
+## texel-corner sampling _ground_y() does (see GROUNDING above). Small: the
+## corners are what matter, this is insurance for the mesh's sub-texel
+## tessellation and costs nothing at placement time.
+const GROUND_FILL_SAMPLES := 5
+## Base lift above the sampled maximum, as a fraction of the footprint
+## radius - enough to keep the base out of the terrain mesh, small enough
+## that the building still reads as standing on the ground.
+const GROUND_LIFT := 0.03
+
 ## Neutral tint for ownerless (built-but-uncaptured) mines.
 const NEUTRAL_COLOR := Color(0.6, 0.6, 0.62)
 
 var _terrain: Node = null
 ## Node probed for heightmap_image / height_scale (heightmap_path target).
 var _heightmap_source: Node = null
-## Cached heightmap image. NoiseTexture2D generates asynchronously, so
-## get_image() returns null until it's ready - we keep the first non-null
-## result and use it for every later placement.
+## The texture currently sampled for heights, and its generated image.
+## NoiseTexture2D generates asynchronously, so get_image() returns null until
+## it's ready; the image is dropped whenever the texture regenerates (the
+## noise seed is randomized at startup, and a stale image would ground
+## buildings against terrain that no longer exists).
+var _heightmap_tex: NoiseTexture2D = null
 var _heightmap_img: Image = null
 
 ## Building per hex, for dedup/replace: Vector2i(col,row) -> Node3D
@@ -81,7 +102,7 @@ func _ready() -> void:
 		_terrain = get_node_or_null(terrain_path)
 	if heightmap_path != NodePath():
 		_heightmap_source = get_node_or_null(heightmap_path)
-	_heightmap_img = _fetch_heightmap_image()
+	_refresh_heightmap_texture()
 
 
 ## The node to read heightmap_image / height_scale from: the explicit
@@ -90,16 +111,37 @@ func _height_source() -> Node:
 	return _heightmap_source if _heightmap_source != null else _terrain
 
 
-## Grabs the terrain's NoiseTexture2D image. Returns null while the texture
-## is still generating - callers must handle that (we cache once it exists).
-func _fetch_heightmap_image() -> Image:
+## Tracks the terrain's NoiseTexture2D: picks up a new texture and forgets the
+## generated image whenever the texture regenerates (its `changed` signal),
+## so heights are always sampled from the image the terrain is actually made
+## of. Safe to call at any time.
+func _refresh_heightmap_texture() -> void:
 	var src := _height_source()
 	if src == null:
-		return null
+		return
 	var tex: Variant = src.get("heightmap_image")
-	if tex is NoiseTexture2D:
-		return tex.get_image()
-	return null
+	if not tex is NoiseTexture2D:
+		return
+	if tex != _heightmap_tex:
+		_heightmap_tex = tex
+		_heightmap_img = null
+		if not tex.changed.is_connected(_on_heightmap_changed):
+			tex.changed.connect(_on_heightmap_changed)
+
+
+func _on_heightmap_changed() -> void:
+	# Regenerated (new seed / new noise): resample on the next placement.
+	_heightmap_img = null
+
+
+## The terrain's current generated image, or null while it's still baking.
+## Re-read per placement: NoiseTexture2D caches its own image, so this is a
+## cheap accessor, not a regeneration.
+func _heightmap_image() -> Image:
+	_refresh_heightmap_texture()
+	if _heightmap_img == null and _heightmap_tex != null:
+		_heightmap_img = _heightmap_tex.get_image()
+	return _heightmap_img
 
 
 ## The height scale that matches the terrain's sampling (the terrain node's
@@ -113,26 +155,81 @@ func _active_height_scale() -> float:
 	return height_scale
 
 
-## Terrain height under a building footprint: the MAX of the heightmap
-## sample at the center and at four points offset by the footprint radius.
-## Max (not just the center) so a building straddling a slope never has part
-## of its base buried in rising ground. A small lift keeps the base just
-## above the surface so it never z-fights with the terrain mesh.
-func _ground_y(world_x: float, world_z: float, footprint_radius: float) -> float:
-	var img := _heightmap_img
+## Terrain height under a building footprint: the MAX heightmap sample over the
+## footprint's bounding square, so a building straddling a ridge or a slope
+## never has part of its base buried in rising ground (see the GROUNDING note
+## at the top of this file for the measured failure).
+##
+## The heightmap sampler is bilinear, so its maximum over any rectangle is
+## attained at a corner of one of the texels that rectangle covers, or where
+## its own edges cross texel lines - NOT at an arbitrary point of a fixed grid.
+## Sampling only a spread of points (dense grid or center + cardinal points)
+## therefore always underprices a ridge that crosses the footprint, so this
+## samples exactly those kink points: the square's four corners, every texel
+## corner inside it, and the texel-line crossings along its edges. A small
+## interior fill is kept as insurance for the terrain mesh's sub-texel
+## tessellation (which samples the same bilinear function, and so can never
+## exceed these values).
+##
+## `fallback` is used while the heightmap image isn't generated yet: pass the
+## hex's own sampled height so a building placed during startup still lands on
+## the (flat, placeholder) terrain instead of at y = 0.
+func _ground_y(world_x: float, world_z: float, footprint_radius: float, fallback: float = 0.0) -> float:
+	var img := _heightmap_image()
 	if img == null:
-		img = _fetch_heightmap_image()
-		_heightmap_img = img
-	if img == null:
-		return 0.0
+		return fallback
 	var hs := _active_height_scale()
 	var inv_scale := 1.0 / maxf(mesh_scale, 0.001)
+	var img_w := img.get_width()
+	var img_h := img.get_height()
+
+	# Footprint square in the sampler's own input space.
+	var u0 := (world_x - footprint_radius) * inv_scale
+	var u1 := (world_x + footprint_radius) * inv_scale
+	var v0 := (world_z - footprint_radius) * inv_scale
+	var v1 := (world_z + footprint_radius) * inv_scale
+
+	# The sampler offsets its input by half the image, so texel centres live
+	# at integer (u + img_w * 0.5).
+	var half_w := float(img_w) * 0.5
+	var half_h := float(img_h) * 0.5
 	var best := -INF
-	for off in [Vector2.ZERO, Vector2.RIGHT, Vector2.LEFT, Vector2.DOWN, Vector2.UP]:
-		var x = world_x + off.x * footprint_radius
-		var z = world_z + off.y * footprint_radius
-		best = maxf(best, HexTile._sample_height(img, img.get_width(), img.get_height(), x * inv_scale, z * inv_scale, hs))
-	return best + footprint_radius * 0.03
+	best = maxf(best, _sample_at(img, u0, v0, hs))
+	best = maxf(best, _sample_at(img, u0, v1, hs))
+	best = maxf(best, _sample_at(img, u1, v0, hs))
+	best = maxf(best, _sample_at(img, u1, v1, hs))
+
+	var tx0 := ceili(u0 + half_w)
+	var tx1 := floori(u1 + half_w)
+	var tz0 := ceili(v0 + half_h)
+	var tz1 := floori(v1 + half_h)
+	for tx in range(tx0, tx1 + 1):
+		for tz in range(tz0, tz1 + 1):
+			best = maxf(best, _sample_at(img, float(tx) - half_w, float(tz) - half_h, hs))
+
+	# Texel-line crossings along the footprint's edges: the kinks that lie ON
+	# the boundary, which the interior texel corners don't cover.
+	for tx in range(tx0, tx1 + 1):
+		var eu := clampf(float(tx) - half_w, u0, u1)
+		best = maxf(best, _sample_at(img, eu, v0, hs))
+		best = maxf(best, _sample_at(img, eu, v1, hs))
+	for tz in range(tz0, tz1 + 1):
+		var ev := clampf(float(tz) - half_h, v0, v1)
+		best = maxf(best, _sample_at(img, u0, ev, hs))
+		best = maxf(best, _sample_at(img, u1, ev, hs))
+
+	# Interior fill (see the comment above).
+	var n := GROUND_FILL_SAMPLES
+	for ix in range(n):
+		var fu: float = lerpf(u0, u1, float(ix) / float(n - 1))
+		for iz in range(n):
+			best = maxf(best, _sample_at(img, fu, lerpf(v0, v1, float(iz) / float(n - 1)), hs))
+
+	return best + footprint_radius * GROUND_LIFT
+
+
+func _sample_at(img: Image, u: float, v: float, height_scale_value: float) -> float:
+	return HexTile._sample_height(img, img.get_width(), img.get_height(), u, v, height_scale_value)
 
 
 ## World-space circumradius of a parent hex.
@@ -162,10 +259,11 @@ func place_building(col: int, row: int, building_id: int, team: int, built: bool
 	if _terrain and _terrain.has_method("get_hex_center"):
 		center = _terrain.get_hex_center(col, row)
 	var building := _make_building_mesh(building_id, team, built)
-	# Y comes from the heightmap, NOT get_hex_center(): the single center
-	# sample ignores the footprint's reach (buildings sank into slopes), and
-	# it returns 0.0 while the heightmap texture is still generating.
-	building.position = Vector3(center.x, _ground_y(center.x, center.z, _footprint_radius(building_id)), center.z)
+	# Y comes from the heightmap over the whole footprint, NOT from the hex
+	# center alone: a center sample ignores the footprint's reach, so a
+	# building on a ridge or slope sank into rising ground.
+	var ground := _ground_y(center.x, center.z, _footprint_radius(building_id), center.y)
+	building.position = Vector3(center.x, ground, center.z)
 	add_child(building)
 	_hex_buildings[hex_key] = building
 	return building
@@ -195,7 +293,7 @@ func _make_building_mesh(building_id: int, team: int, built: bool = true) -> Nod
 	var mat := StandardMaterial3D.new()
 	# Owned buildings wear their team's FULL color (same palette as the
 	# dots). team < 0 = ownerless (uncaptured mine): plain gray.
-	mat.albedo_color = NEUTRAL_COLOR if team < 0 else _team_color(team)
+	mat.albedo_color = NEUTRAL_COLOR if team < 0 else team_color(team)
 	mat.roughness = 0.8
 
 	# Construction site: tiny translucent ghost at ground level. set_built()
@@ -281,12 +379,15 @@ func recolor_building_at(hex_key: Vector2i, team: int) -> void:
 		return
 	building.set_meta("team", team)
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = NEUTRAL_COLOR if team < 0 else _team_color(team)
+	mat.albedo_color = NEUTRAL_COLOR if team < 0 else team_color(team)
 	mat.roughness = 0.8
 	building.get_child(0).material_override = mat
 
 
-func _team_color(team: int) -> Color:
+## The one team palette: buildings, the lobby's player list and anything else
+## showing "which team is this" use it, so a team is never two colors.
+## Static so callers don't need a live manager instance.
+static func team_color(team: int) -> Color:
 	# First four teams keep the classic colors; any team beyond gets an
 	# evenly spaced hue (golden-angle) so ANY team count gets distinct
 	# colors. The NPC horde never owns buildings, so it needs no entry.

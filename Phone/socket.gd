@@ -19,11 +19,14 @@ class_name HexGrid2DSocket
 ## `websocket_port`). The message format is IDENTICAL (put_var/get_var
 ## dictionaries) - only the pipe changes, so every view script works
 ## unchanged in the browser. The target is resolved, in order, from:
-##   1. the page URL query: ?host=192.168.1.82&port=9080 (or ?url=ws://...)
-##   2. the hostname the page was served from (window.location.hostname),
-##      unless it's localhost - handy when the export is hosted on the
-##      game machine itself
-##   3. the exported `host` as a last resort
+##   1. the UI override (connect screen), if the player typed one
+##   2. the page URL query: ?url=wss://... (verbatim) or ?host=IP&port=N
+##   3. the page's own hostname - ONLY on plain-HTTP pages (i.e. the
+##      export is hosted on the game machine); HTTPS hosts like github.io
+##      or itch.io are CDNs, never the game server
+##   4. the exported `host` as a last resort
+##   The scheme follows the page protocol: HTTPS pages dial wss:// (browsers
+##   block ws:// from secure pages), HTTP pages dial ws://.
 ## UDP LAN discovery is impossible in a browser, so it's skipped there.
 
 ## Manually-set target - only used if use_lan_discovery is false, or as the
@@ -69,6 +72,18 @@ signal team_resources_received(team: int, amount: float)
 ## it to show/hide the manual-connect screen.
 signal connection_state_changed(connected: bool)
 
+## Emitted when the main screen hands this phone its team, with that team's
+## color (the main screen owns the palette - see its assigned_team_message()).
+## The UI shows it so a player always knows which army is theirs.
+signal team_assigned(team: int, color: Color)
+
+## The lobby state the main screen broadcasts: whether the match has
+## started, this phone's own spawn hexes, and how many hexes each team has
+## picked. Sent on join, on every pick and the moment the match starts -
+## the phone shows its spawn picker while `started` is false and hides it
+## afterwards.
+signal lobby_state_received(started: bool, hexes: Array, picked: Array)
+
 ## Exact bytes expected on each side of the discovery handshake - see
 ## matching constants in HexTerrainSocket.
 const DISCOVERY_REQUEST := "HEX_TERRAIN_DISCOVER"
@@ -90,6 +105,12 @@ var remote_host_override := ""
 ## whenever the page itself is HTTPS - itch.io, GitHub Pages - because
 ## browsers block insecure ws:// from secure pages as mixed content).
 var remote_use_tls := false
+## True when the typed address carried an explicit scheme (ws:// / wss://).
+## A schemeless entry on an HTTPS page is forced to wss, since ws:// from a
+## secure page can never work.
+var remote_scheme_explicit := false
+## Port typed as part of the address ("host:9080"); 0 = none given.
+var remote_explicit_port := 0
 
 var _discovery_udp := PacketPeerUDP.new()
 var _discovery_elapsed := 0.0
@@ -131,6 +152,12 @@ func _broadcast_discovery_request() -> void:
 	print("HexGrid2DSocket: broadcast discovery request on UDP %d." % discovery_port)
 
 func _try_connect() -> void:
+	# Last-ditch guard: a port outside the valid range (a mis-parsed discovery
+	# reply, a bad typed address) only produces an opaque engine error from
+	# connect_to_host, so reject it where the cause is still visible.
+	if port <= 0 or port > 65535:
+		push_error("HexGrid2DSocket: invalid port %d for host \"%s\" - not connecting." % [port, host])
+		return
 	var err := _tcp.connect_to_host(host, port)
 	print("HexGrid2DSocket: connecting to %s:%d -> %s" % [host, port, error_string(err)])
 
@@ -149,8 +176,9 @@ func _process(delta: float) -> void:
 			if not _was_connected:
 				print("HexGrid2DSocket: connected to terrain server.")
 				_peer.put_var({"type": "request_terrain"})
-			_was_connected = true
-			_retry_elapsed = 0.0
+				_was_connected = true
+				_retry_elapsed = 0.0
+				emit_signal("connection_state_changed", true)
 			while _peer.get_available_packet_count() > 0:
 				_handle_message(_peer.get_var())
 		StreamPeerTCP.STATUS_CONNECTING:
@@ -160,6 +188,7 @@ func _process(delta: float) -> void:
 		   # again on its own.
 			if _was_connected:
 				print("HexGrid2DSocket: disconnected from terrain server.")
+				emit_signal("connection_state_changed", false)
 			_was_connected = false
 			_retry_elapsed += delta
 			if _retry_elapsed >= retry_interval:
@@ -178,49 +207,144 @@ func _process(delta: float) -> void:
 
 ## --- WEB EXPORT TRANSPORT (WebSocket) ---------------------------------------
 
-## Decides where the WebSocket should connect. An explicitly-set remote
-## host (UI override) wins, then query params on the page URL
-## (?host=IP&port=9080 or ?url=ws://IP:9080), then the hostname the
-## page itself was served from (unless it's localhost), then the exported
-## `host`.
-func _resolve_web_url() -> String:
-	var ws_host := host
-	var ws_port := websocket_port
-	# A UI-typed override wins over everything.
+## Decides where the WebSocket should connect. Deliberately free of browser
+## APIs so Tests/connect_resolve.gd can drive it with synthetic
+## window.location values. Returns a Dictionary:
+##   {url, host, port, tls, include_port, source, usable}
+## `url` is empty when there is nothing worth dialing (see the HTTPS note
+## under 4); `include_port` false means the scheme's default port is used
+## implicitly (443 for wss), which is what TLS tunnels need - their public
+## URLs carry no port at all.
+##
+## Resolution order:
+##   1. the address typed into the connect screen (UI override)
+##   2. the page URL query: ?url=wss://... (verbatim) or ?host=IP&port=N
+##   3. the page's own hostname - ONLY on plain-HTTP pages, i.e. the export
+##      is served BY the game machine; an HTTPS hostname is a CDN and can
+##      never be the game server
+##   4. the exported `host`, again only when a plain ws:// can leave the
+##      page. On an HTTPS page ws:// is blocked as mixed content, so with
+##      no address supplied the result is unusable and the connect screen
+##      takes over instead of dialing a guaranteed failure.
+func resolve_web_target(page_href: String, page_hostname: String,
+		page_protocol: String) -> Dictionary:
+	var page_https := page_protocol.begins_with("https")
+
+	# 1. Address typed into the connect screen.
 	if not remote_host_override.is_empty():
-		var scheme := "wss" if remote_use_tls else "ws"
-		return "%s://%s:%d" % [scheme, remote_host_override, ws_port]
-	if OS.has_feature("web"):
-		# JavaScriptBridge.eval returns JS objects as opaque JavaScriptObjects -
-		# NOT GDScript Dictionaries - so pull out plain strings instead.
-		var href := str(JavaScriptBridge.eval("window.location.href", true))
-		var hostname := str(JavaScriptBridge.eval("window.location.hostname", true))
-		var qi := href.find("?")
-		if qi >= 0:
-			for pair in href.substr(qi + 1).split("&", false):
-				var kv := pair.split("=", true, 1)
-				if kv.size() != 2:
-					continue
-				match kv[0]:
-					"url":
-						return kv[1].uri_decode()
-					"host":
-						ws_host = kv[1].uri_decode()
-					"port":
-						var p := kv[1].to_int()
-						if p > 0:
-							ws_port = p
-		elif not hostname.is_empty() and hostname != "localhost" and hostname != "127.0.0.1":
-			# No explicit params: reuse the host the page itself was served
-			# from (works when the export is hosted on the game machine).
-			ws_host = hostname
-	return "ws://%s:%d" % [ws_host, ws_port]
+		var tls := remote_use_tls
+		if not remote_scheme_explicit and page_https:
+			# ws:// from a secure page is blocked before it leaves the
+			# browser, so a schemeless entry is treated as wss.
+			tls = true
+		if remote_explicit_port > 0:
+			return _target(remote_host_override, remote_explicit_port, tls, true, "manual")
+		if tls:
+			# TLS endpoints (Cloudflare tunnels, reverse proxies) answer on
+			# 443 - appending the LAN ws port would break them.
+			return _target(remote_host_override, 443, true, false, "manual")
+		return _target(remote_host_override, websocket_port, false, true, "manual")
+
+	# 2. Query params on the page URL (?url= wins over ?host=).
+	var params := _parse_query(page_href)
+	var url_param := str(params.get("url", "")).strip_edges()
+	if not url_param.is_empty():
+		var tls := url_param.begins_with("wss://")
+		var body := url_param.trim_prefix("wss://").trim_prefix("ws://")
+		var slash := body.find("/")
+		if slash >= 0:
+			body = body.substr(0, slash)
+		var port := 0
+		var colon := body.rfind(":")
+		if colon > 0:
+			port = body.substr(colon + 1).to_int()
+			if port > 0:
+				body = body.substr(0, colon)
+		if not body.is_empty():
+			if port > 0:
+				return _target(body, port, tls, true, "?url=")
+			return _target(body, 443 if tls else websocket_port, tls, not tls, "?url=")
+	var host_param := str(params.get("host", "")).strip_edges()
+	if not host_param.is_empty():
+		var port := int(str(params.get("port", websocket_port)))
+		if port <= 0:
+			port = websocket_port
+		return _target(host_param, port, page_https, true, "?host=")
+
+	# 3. The page's own hostname - plain-HTTP pages only (see the header).
+	if not page_https and not page_hostname.is_empty() \
+			and page_hostname != "localhost" and page_hostname != "127.0.0.1":
+		return _target(page_hostname, websocket_port, false, true, "page host")
+
+	# 4. The exported `host`, when a plain ws:// can actually leave the page.
+	if not page_https:
+		return _target(host, websocket_port, false, true, "exported host")
+
+	return _target("", websocket_port, false, false, "none")
+
+
+## Builds one resolution result. Single place that formats the URL, so the
+## override / query / fallback paths can't drift apart.
+func _target(h: String, port: int, tls: bool, include_port: bool, source: String) -> Dictionary:
+	var url := ""
+	if not h.is_empty():
+		var scheme := "wss" if tls else "ws"
+		url = ("%s://%s:%d" % [scheme, h, port]) if include_port else ("%s://%s" % [scheme, h])
+	return {
+		"url": url,
+		"host": h,
+		"port": port,
+		"tls": tls,
+		"include_port": include_port,
+		"source": source,
+		"usable": not url.is_empty(),
+	}
+
+
+## Parses the query string of a page URL into decoded key/value strings.
+## The fragment is dropped first - otherwise it glues itself onto the last
+## value ("?host=1.2.3.4#foo" -> "1.2.3.4#foo").
+func _parse_query(href: String) -> Dictionary:
+	var out := {}
+	var query := href
+	var hash := query.find("#")
+	if hash >= 0:
+		query = query.substr(0, hash)
+	var qi := query.find("?")
+	if qi < 0:
+		return out
+	for pair in query.substr(qi + 1).split("&", false):
+		var kv := pair.split("=", true, 1)
+		if kv.size() != 2:
+			continue
+		out[kv[0]] = kv[1].uri_decode()
+	return out
+
+
+## The resolved URL the phone will dial next. Empty string = nothing to
+## dial yet (the connect screen is the way in).
+func _resolve_web_url() -> String:
+	if not OS.has_feature("web"):
+		return "ws://%s:%d" % [host, websocket_port]
+	# JavaScriptBridge.eval returns JS objects as opaque JavaScriptObjects -
+	# NOT GDScript Dictionaries - so pull out plain strings instead.
+	var target := resolve_web_target(
+			str(JavaScriptBridge.eval("window.location.href", true)),
+			str(JavaScriptBridge.eval("window.location.hostname", true)),
+			str(JavaScriptBridge.eval("window.location.protocol", true)))
+	return str(target.url)
 
 func _connect_websocket() -> void:
 	# The terrain message is well over the 64 KB default WS buffers (Godot
 	# silently breaks above it) - match the 4 MB the TCP path uses.
 	_ws.inbound_buffer_size = 4 * 1024 * 1024
 	_ws.outbound_buffer_size = 4 * 1024 * 1024
+	if _ws_url.is_empty():
+		# Nothing usable to dial yet - e.g. the page is hosted on an HTTPS
+		# CDN and no game address has been supplied. Retrying a guaranteed
+		# failure once a second just spams the console; the connect screen
+		# is what gets the player in.
+		return
 	var err := _ws.connect_to_url(_ws_url)
 	if err == OK:
 		print("HexGrid2DSocket: WebSocket connecting to %s ..." % _ws_url)
@@ -264,13 +388,32 @@ func _ws_send(msg: Dictionary) -> void:
 func set_remote_target(target: String, new_port: int = 0) -> void:
 	if not _is_web:
 		return
+	parse_remote_target(target, new_port)
+	if not remote_host_override.is_empty():
+		print("HexGrid2DSocket: manual target override -> %s (from \"%s\")"
+				% [_resolve_web_url(), target.strip_edges()])
+	else:
+		print("HexGrid2DSocket: manual target cleared - back to automatic resolution.")
+	reconnect_websocket()
+
+
+## Parses a typed address into the override state, WITHOUT connecting -
+## split out from set_remote_target() so Tests/connect_resolve.gd can
+## exercise the parsing headlessly. Accepts "IP", "IP:port",
+## "ws://host[:port][/path]" and "wss://host[:port][/path]"; an empty
+## string clears the override and returns to automatic resolution.
+func parse_remote_target(target: String, new_port: int = 0) -> void:
 	var t := target.strip_edges()
 	# Full URL form: pull host:port out of it and remember the scheme.
 	remote_use_tls = false
+	remote_scheme_explicit = false
+	remote_explicit_port = new_port if new_port > 0 else 0
 	if t.begins_with("wss://"):
 		remote_use_tls = true
+		remote_scheme_explicit = true
 		t = t.trim_prefix("wss://")
 	elif t.begins_with("ws://"):
+		remote_scheme_explicit = true
 		t = t.trim_prefix("ws://")
 	# Strip any path ("wss://host/whatever" -> "host"); we dial the root.
 	var slash := t.find("/")
@@ -281,14 +424,9 @@ func set_remote_target(target: String, new_port: int = 0) -> void:
 	if colon > 0:
 		var p := t.substr(colon + 1).to_int()
 		if p > 0:
-			websocket_port = p
-		t = t.substr(0, colon)
+			remote_explicit_port = p
+			t = t.substr(0, colon)
 	remote_host_override = t
-	if new_port > 0:
-		websocket_port = new_port
-	if not remote_host_override.is_empty():
-		print("HexGrid2DSocket: manual target override -> %s:%d" % [remote_host_override, websocket_port])
-	reconnect_websocket()
 
 ## Tear down the current WebSocket (if any) and start a fresh connection
 ## using the current target resolution. Safe to call at any time.
@@ -304,9 +442,20 @@ func reconnect_websocket() -> void:
 func is_web_connected() -> bool:
 	return _is_web and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN
 
-## The ws:// URL the phone will dial next (for UI display).
+## The ws:// / wss:// URL the phone will dial next (for UI display). Empty
+## while nothing usable has been resolved - the UI turns that into a prompt.
 func get_current_ws_url() -> String:
 	return _resolve_web_url()
+
+## Human-readable explanation of where the current target came from - handy
+## in the connect screen and in logs. See resolve_web_target().
+func get_target_source() -> String:
+	if not OS.has_feature("web"):
+		return "native tcp"
+	return str(resolve_web_target(
+			str(JavaScriptBridge.eval("window.location.href", true)),
+			str(JavaScriptBridge.eval("window.location.hostname", true)),
+			str(JavaScriptBridge.eval("window.location.protocol", true))).source)
 
 ## JSON-safe conversion: put_var ships Variants (Vector2, Color...) natively
 ## over the TCP path, but JSON can't. Vector2/Vector2i -> [x, y],
@@ -340,19 +489,45 @@ func _deref_json(msg: Dictionary) -> Dictionary:
 						float(c.get("b", 1.0)), float(c.get("a", 1.0)))
 	return msg
 
+## Parses the payload of a discovery reply - "<tcp_port>" from servers that
+## predate the WebSocket transport, "<tcp_port>:<ws_port>" from current ones -
+## into {"port": int, "websocket_port": int}, or {} for anything unusable.
+##
+## The fields must be split explicitly: to_int() on the whole "4242:9080"
+## absorbs the colon and returns 42429080, which is not a valid port, so every
+## native phone rejected its LAN server and fell back to 127.0.0.1.
+## Kept static so it can be tested without real sockets (Tests/connect_resolve.gd).
+static func parse_discovery_reply(text: String, fallback_ws_port: int) -> Dictionary:
+	if not text.begins_with(DISCOVERY_REPLY_PREFIX):
+		return {}
+	var fields := text.trim_prefix(DISCOVERY_REPLY_PREFIX).split(":", false)
+	if fields.is_empty():
+		return {}
+	var tcp_port := int(fields[0])
+	if tcp_port <= 0 or tcp_port > 65535:
+		return {}
+	var ws_port := fallback_ws_port
+	if fields.size() > 1:
+		var parsed_ws := int(fields[1])
+		# A malformed second field must not throw away a good TCP port.
+		if parsed_ws > 0 and parsed_ws <= 65535:
+			ws_port = parsed_ws
+	return {"port": tcp_port, "websocket_port": ws_port}
+
+
 ## Listens for a discovery reply and, once one arrives, switches over to
 ## the normal TCP connect flow using whatever IP it came from.
 func _poll_discovery(delta: float) -> void:
 	while _discovery_udp.get_available_packet_count() > 0:
 		var packet := _discovery_udp.get_packet()
 		var text := packet.get_string_from_utf8()
-		if not text.begins_with(DISCOVERY_REPLY_PREFIX):
+		var reply := parse_discovery_reply(text, websocket_port)
+		if reply.is_empty():
 			continue
 
 		var found_host := _discovery_udp.get_packet_ip()
-		var found_port := text.trim_prefix(DISCOVERY_REPLY_PREFIX).to_int()
-		if found_port <= 0:
-			continue
+		var found_port: int = reply["port"]
+		websocket_port = reply["websocket_port"]
 
 		print("HexGrid2DSocket: found terrain server at %s:%d." % [found_host, found_port])
 		host = found_host
@@ -374,6 +549,16 @@ func _poll_discovery(delta: float) -> void:
 	if _discovery_elapsed >= discovery_broadcast_interval:
 		_discovery_elapsed = 0.0
 		_broadcast_discovery_request()
+
+## The team color the main screen sent alongside the assignment, as [r,g,b]
+## floats. A server that predates the color field just means a neutral grey
+## badge instead of no badge at all.
+static func _color_from_message(msg: Dictionary) -> Color:
+	var arr: Variant = msg.get("color")
+	if arr is Array and (arr as Array).size() >= 3:
+		return Color(float(arr[0]), float(arr[1]), float(arr[2]))
+	return Color(0.75, 0.75, 0.78)
+
 
 func _get_grid_2d() -> Node:
 	if hex_grid_2d_path != NodePath():
@@ -411,14 +596,23 @@ func _handle_message(msg) -> void:
 	# has to request it or figure it out itself beyond just listening here.
 	if msg.type == "assigned_team":
 		var team: int = msg.team
+		var team_color := _color_from_message(msg)
 		print("HexGrid2DSocket: assigned team %d." % team)
 		if grid_2d:
 			grid_2d.team_number = team
+			if "team_color" in grid_2d:
+				grid_2d.team_color = team_color
+		team_assigned.emit(team, team_color)
 		return
 
 	# Once-per-second economy updates from the main screen: how many
 	# resources each team holds. The phone view displays its own team's
 	# amount (see main_phone_view.gd).
+	if msg.type == "lobby_state":
+		lobby_state_received.emit(bool(msg.get("started", true)), msg.get("hexes", []),
+				msg.get("picked", []))
+		return
+
 	if msg.type == "team_resources":
 		team_resources_received.emit(int(msg.team), float(msg.amount))
 		return
@@ -438,6 +632,20 @@ func _handle_message(msg) -> void:
 
 ## Called by HexGrid2D when a cell is clicked (tap or hover) - tells the
 ## 3D side which tile to run its click function on.
+## The hexes this phone wants its starting army divided across (lobby only,
+## up to 3, in pick order). The main screen validates them - walls and hexes
+## off the map are dropped there, and it echoes the accepted list back in
+## the next lobby_state.
+func send_spawn_hexes(cells: Array, team_number: int) -> void:
+	var payload: Array = []
+	for cell in cells:
+		payload.append([int(cell.x), int(cell.y)])
+	if _is_web:
+		_ws_send({"type": "spawn_hex", "cells": payload, "team": team_number})
+	else:
+		_peer.put_var({"type": "spawn_hex", "cells": payload, "team": team_number})
+
+
 func send_tile_clicked(col: int, row: int, team_number: int) -> void:
 	if _is_web:
 		_ws_send({"type": "tile_clicked", "col": col, "row": row, "team": team_number})

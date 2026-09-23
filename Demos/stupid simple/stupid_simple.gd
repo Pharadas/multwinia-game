@@ -132,7 +132,22 @@ const DESERTION_RATE := 0.0000015
 ## sim.glsl to check path expiry timestamps.
 var _elapsed_seconds: float = 0.0
 
+## LOBBY GATE. The main screen owns when the match actually begins: it lists
+## the phones that have joined and calls start_game() when the host is ready
+## (see main_screen.gd's lobby overlay). Until then the army is still
+## rendered, standing where it spawned, but NOTHING advances - no economy
+## tick, miner respawns, movement, combat, desertion or building work - so
+## players can join without the clock, resources or map state moving on
+## without them.
+var game_started: bool = false
+
 ## Last sim timestamp (params.w * 256, truncated to 24 bits) at which the
+## How often the explosion buffer is read back from the GPU. Must stay well
+## under BLAST_TTL (0.4 s) so a charging boid's first visual frame is never
+## missed; 0.1 s is 6x the safety margin at 1/6 the readback cost.
+const EXPLODE_POLL_INTERVAL := 0.1
+var _explode_poll_time := -1.0
+
 ## CPU read the explosion buffer - read_explosions() reports only blasts
 ## detonated after this, so each blast yields exactly one
 ## explosion_occurred signal. 1/256 s resolution matches sim.glsl.
@@ -161,6 +176,9 @@ const MINER_COUNT := 7
 const SPECIAL_MINE_BONUS := 100.0  # 3x a normal mine: 50 base + 2x50 bonus
 const MINER_RESPAWN_INTERVAL := 3.0
 const STATE_MINER_FLAG := 0x80     # must match sim.glsl's STATE_MINER bit
+## "no path assigned" sentinel for the u32 path-hex field (must match the
+## shader's NO_PATH and count.glsl's skip test).
+const NO_PATH := 0xFFFFFFFF
 const MINER_HEALTH := 3000         # 10x a regular dot: takes focused raids
 
 const MINE_INCOME := 50.0          # resources per second per owned mine
@@ -408,123 +426,9 @@ func _create_buffers() -> void:
 	# rounded up to the vec4 alignment = 64 bytes = 16 floats per boid.
 	# CPU field order MUST match: pos(0-3) vel(4-7) state(8) path_hex(9)
 	# path_slot(10) team(11) health(12) home_hex(13) pad(14-15).
-	var floats_per_boid := 16
-	var state_bytes := instance_count * floats_per_boid * 4  # 48 bytes/boid
-
-	var init_state := PackedFloat32Array()
-	init_state.resize(instance_count * floats_per_boid)
-
-	# Only seed the live army: PLAYER teams only (0..num_teams-2) - the last
-	# slot is the reserved NPC horde, which starts empty and fills up purely
-	# through desertion. Every team gets the same count, assigned round-robin.
-	var player_teams := maxi(num_teams - 1, 1)
-	var live_count := _dots_per_team * player_teams
-	for i in range(live_count):
-		var team := i % player_teams
-		var base := i * floats_per_boid
-		var p := Vector3(
-			randf_range(WORLD_MIN.x, WORLD_MAX.x),
-			randf_range(WORLD_MIN.y, WORLD_MAX.y),
-			randf_range(WORLD_MIN.z, WORLD_MAX.z)
-		)
-		var v := Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)).normalized() * randf_range(1.0, MAX_SPEED)
-		init_state[base + 0] = p.x
-		init_state[base + 1] = p.y
-		init_state[base + 2] = p.z
-		init_state[base + 3] = 0.0
-		init_state[base + 4] = v.x
-		init_state[base + 5] = 0.0
-		init_state[base + 6] = v.z
-		init_state[base + 7] = 0.0
-
-		var bytes = PackedByteArray()
-		bytes.resize(4)
-		var hex = world_to_hex(Vector2(p.x, p.z))
-		bytes.encode_u32(0, hex_to_id(hex.x, hex.y))
-		init_state[base + 8] = bytes.decode_float(0)
-
-		var no_path_bytes := PackedByteArray()
-		no_path_bytes.resize(4)
-		no_path_bytes.encode_u32(0, 0xFFFFFFFF)
-		init_state[base + 9] = no_path_bytes.decode_float(0)
-		init_state[base + 10] = 0.0
-		var tb := PackedByteArray()
-		tb.resize(4)
-		tb.encode_u32(0, team)
-		init_state[base + 11] = tb.decode_float(0)
-
-		var health := PackedByteArray()
-		health.resize(4)
-		health.encode_u32(0, 1000)
-		init_state[base + 12] = health.decode_float(0)
-		var hh := PackedByteArray()
-		hh.resize(4)
-		hh.encode_s32(0, hex_to_id(hex.x, hex.y))
-		init_state[base + 13] = hh.decode_float(0)
-
-
-
-
-	# --- spawn teams into their corner bases (CPU-side, no buffer_update needed) ---
-	_compute_team_bases()
-	for team in range(num_teams - 1):
-		var base_arr: Array = team_bases[team]
-		var spawn_tiles: Array = []
-		for c in range(base_arr[0], base_arr[2] + 1):
-			for r in range(base_arr[1], base_arr[3] + 1):
-				if c == base_arr[0] and r == base_arr[1]:
-					continue  # skip generator tile
-				spawn_tiles.append(Vector2i(c, r))
-		var team_boids: Array = []
-		for i in range(_dots_per_team * (num_teams - 1)):
-			if i % (num_teams - 1) == team:
-				team_boids.append(i)
-		var jitter := mesh_scale * 0.3
-		for bi in range(team_boids.size()):
-			var boid_id: int = team_boids[bi]
-			var cell: Vector2i = spawn_tiles[bi % spawn_tiles.size()]
-			var center := get_hex_center(cell.x, cell.y)
-			var offset := Vector3(randf_range(-jitter, jitter), randf_range(0.0, 4.0), randf_range(-jitter, jitter))
-			var pos := center + offset
-			var hex := world_to_hex(Vector2(pos.x, pos.z))
-			var hex_id := hex_to_id(hex.x, hex.y)
-			var b := boid_id * floats_per_boid
-			init_state[b + 0] = pos.x
-			init_state[b + 1] = pos.y
-			init_state[b + 2] = pos.z
-			var hb := PackedByteArray()
-			hb.resize(4)
-			hb.encode_u32(0, hex_id)
-			init_state[b + 3] = hb.decode_float(0)
-			init_state[b + 4] = 0.0  # vel.x
-			init_state[b + 5] = 0.0  # vel.y
-			init_state[b + 6] = 0.0  # vel.z
-			init_state[b + 7] = 0.0
-			init_state[b + 8] = 0.0  # state
-			var np := PackedByteArray()
-			np.resize(4)
-			np.encode_u32(0, 0xFFFFFFFF)
-			init_state[b + 9] = np.decode_float(0)  # assigned_path_hex = NO_PATH
-			init_state[b + 10] = 0.0  # assigned_path_slot
-			var tb := PackedByteArray()
-			tb.resize(4)
-			tb.encode_u32(0, team)
-			init_state[b + 11] = tb.decode_float(0)
-			var health := PackedByteArray()
-			health.resize(4)
-			health.encode_u32(0, 1000)
-			init_state[b + 12] = health.decode_float(0)
-			# home_hex = spawn hex
-			var shh := PackedByteArray()
-			shh.resize(4)
-			shh.encode_s32(0, hex_id)
-			init_state[b + 13] = shh.decode_float(0)
-
-	var init_bytes := init_state.to_byte_array()
-	#print(init_bytes)
-
-	state_buffers.append(rd.storage_buffer_create(state_bytes, init_bytes))
-	state_buffers.append(rd.storage_buffer_create(state_bytes, init_bytes))
+	var init_bytes := _build_state_bytes()
+	state_buffers.append(rd.storage_buffer_create(init_bytes.size(), init_bytes))
+	state_buffers.append(rd.storage_buffer_create(init_bytes.size(), init_bytes))
 	# Damage accumulators: one uint per boid, ping-ponged like the state
 	# buffers. Zero-initialized (no data passed in).
 	dmg_buffers.append(rd.storage_buffer_create(instance_count * 4))
@@ -597,6 +501,247 @@ func _create_buffers() -> void:
 	rd.buffer_update(econ_res_rid, 0, clear.size(), clear)
 
 	mm_buffer_rid = RenderingServer.multimesh_get_buffer_rd_rid(multimesh.get_rid())
+
+
+## Builds the initial BoidState bytes for BOTH ping-pong state buffers.
+##
+## Pure CPU, no RenderingDevice - Tests/economy_spawn.gd drives it directly -
+## and it fills ONE preallocated PackedByteArray in place. The version this
+## replaces allocated a PackedFloat32Array plus ~6 throwaway
+## PackedByteArrays PER BOID (resize + encode + decode_float) just to smuggle
+## a u32 into a float slot: at 100k+ slots that was over half a million
+## temporary allocations before the first frame, which is what made startup
+## crawl. It also had a second full scatter pass whose every field was then
+## overwritten by the base spawn - that pass is gone.
+##
+## Slot layout (std430 BoidState, 64 B per slot - must match sim.glsl):
+##   +0  pos.x   +4 pos.y   +8 pos.z   +12 pos.w = owning hex id (u32 bits)
+##   +16 vel.x   +20 vel.y  +24 vel.z  +28 vel.w = wall-bump bits (0 here)
+##   +32 state (u32)      +36 assigned_path_hex (u32, 0xFFFFFFFF = none)
+##   +40 assigned_path_slot (u32)         +44 team (u32)
+##   +48 health (u32)     +52 home_hex (s32)          +56/+60 padding
+##
+## Reserve slots (id >= army size) stay zeroed: health 0 reads as dead, so
+## the GPU never renders them. Production and the special miners fill those
+## in later (see _economy_tick, setup_special_mine).
+func _build_state_bytes() -> PackedByteArray:
+	const ROW := 64
+	var bytes := PackedByteArray()
+	bytes.resize(instance_count * ROW)  # zero-filled
+
+	# Only the live army is seeded, and only the PLAYER teams (0..num_teams-2):
+	# the last slot is the reserved NPC horde, which starts empty and fills up
+	# purely through desertion. Ids are assigned round-robin, so team t owns
+	# every player_teams-th slot - the same mapping the rest of the sim uses.
+	var player_teams := maxi(num_teams - 1, 1)
+	var army := mini(_dots_per_team * player_teams, instance_count)
+	if army <= 0:
+		return bytes
+
+	_compute_team_bases()
+	# Per-tile spawn anchors, computed ONCE. The old loop called
+	# get_hex_center() - which samples the terrain height - and world_to_hex()
+	# for every single dot, tens of interpreter operations each, millions of
+	# times for a large army, all to reproduce the same handful of tile
+	# centers. The anchors are the hexes themselves, so the dot's hex id is
+	# known without a world-to-hex round trip.
+	var anchors_by_team: Array = []
+	for team in range(player_teams):
+		var rect: Array = team_bases[mini(team, team_bases.size() - 1)]
+		var anchors: Array = []
+		for c in range(rect[0], rect[2] + 1):
+			for r in range(rect[1], rect[3] + 1):
+				if c == rect[0] and r == rect[1]:
+					continue  # the generator tile, owned by main_screen
+				anchors.append({"pos": get_hex_center(c, r), "hex": hex_to_id(c, r)})
+		if anchors.is_empty():
+			anchors.append({"pos": get_hex_center(rect[0], rect[1]),
+					"hex": hex_to_id(rect[0], rect[1])})
+		anchors_by_team.append(anchors)
+
+	# bi = id / player_teams walks each team's slots in order without the old
+	# per-team id lists (which were an O(army x teams) scan of the army).
+	var jitter := mesh_scale * 0.3
+	for id in range(army):
+		var team := id % player_teams
+		var anchors: Array = anchors_by_team[team]
+		var anchor: Dictionary = anchors[(id / player_teams) % anchors.size()]
+		var center: Vector3 = anchor.pos
+		var hex_id: int = anchor.hex
+		var pos := center + Vector3(
+			randf_range(-jitter, jitter),
+			randf_range(0.0, 4.0),
+			randf_range(-jitter, jitter)
+		)
+		var off := id * ROW
+		bytes.encode_float(off, pos.x)
+		bytes.encode_float(off + 4, pos.y)
+		bytes.encode_float(off + 8, pos.z)
+		bytes.encode_u32(off + 12, hex_id)      # pos.w = hex this dot stands in
+		# state (32) and path_slot (40) are already zero from the resize.
+		bytes.encode_u32(off + 36, NO_PATH)      # no assigned path
+		bytes.encode_u32(off + 44, team)
+		bytes.encode_u32(off + 48, 1000)         # health
+		bytes.encode_s32(off + 52, hex_id)       # home_hex = spawn hex
+	return bytes
+
+
+## Chosen spawn hexes per team: team -> Array of sim hex cells (Vector2i).
+## Each player picks up to MAX_SPAWN_HEXES hexes on their phone while the
+## lobby is open (MainScreen validates them and forwards world positions)
+## and their starting army is divided among them. A team that picks nothing
+## keeps the corner base its army was seeded into.
+var team_spawn_hexes: Dictionary = {}
+const MAX_SPAWN_HEXES := 3
+
+
+## Divides `count` dots among `k` groups as evenly as possible: the first
+## `count % k` groups take the extra one, so no two groups differ by more
+## than 1 dot and the parts always sum back to `count`.
+static func split_spawn_counts(count: int, k: int) -> Array:
+	var out: Array = []
+	if k <= 0:
+		return out
+	if count <= 0:
+		for _i in range(k):
+			out.append(0)
+		return out
+	var base := count / k
+	var extra := count % k
+	for i in range(k):
+		out.append(base + (1 if i < extra else 0))
+	return out
+
+
+## Lays `count` dots out as a phyllotaxis (golden-angle) disc of radius
+## `radius` around `center`, so an entire army fits inside one hex without
+## piling onto a single point - which matters because the dots' initial
+## separation push is what spreads them out once the match starts. Y comes
+## from `center` (the caller samples the ground once per hex). Deterministic:
+## the same picks always produce the same layout.
+static func spawn_positions_in_hex(center: Vector3, radius: float, count: int) -> Array:
+	var out: Array = []
+	const GOLDEN_ANGLE := 2.399963229728653
+	for i in range(count):
+		var t := (float(i) + 0.5) / float(maxi(count, 1))
+		var ang := GOLDEN_ANGLE * float(i)
+		var rad := radius * sqrt(t)
+		out.append(Vector3(center.x + cos(ang) * rad, center.y, center.z + sin(ang) * rad))
+	return out
+
+
+## A player's spawn picks, arriving from the lobby. `world_positions` are hex
+## centres in world XZ (the same convention set_cell_building uses), so the
+## phone's grid coordinates never have to be translated here. Keeps at most
+## MAX_SPAWN_HEXES DISTINCT hexes that actually exist on this map, then moves
+## that team's already-seeded army into them, divided as evenly as possible.
+func set_team_spawn_hexes(team: int, world_positions: Array) -> void:
+	if rd == null or team < 0 or team >= num_teams:
+		return
+	var cells: Array = []
+	for entry in world_positions:
+		if cells.size() >= MAX_SPAWN_HEXES:
+			break
+		# Callers pass XZ world points (a Vector2, like set_cell_building); a
+		# Vector3 is accepted too and flattened the same way. Reading `.z` off
+		# a Vector2 is a hard error, so the two are handled separately.
+		var p := Vector2.ZERO
+		if entry is Vector2:
+			p = entry
+		elif entry is Vector3:
+			p = Vector2(entry.x, entry.z)
+		else:
+			continue
+		var cell: Vector2i = world_to_hex(p)
+		var id := hex_to_id(cell.x, cell.y)
+		# Off the map: ignore the pick rather than strand the army outside
+		# the hex layout (which would make every hex lookup on those dots
+		# return a garbage cell).
+		if id < 0 or id >= hex_total_cells:
+			continue
+		if cells.has(cell):
+			continue
+		cells.append(cell)
+	if cells.is_empty():
+		team_spawn_hexes.erase(team)
+	else:
+		team_spawn_hexes[team] = cells
+	_relocate_team_army(team)
+
+
+## The hexes a team's starting army stands in, as sim hex cells. Empty means
+## "never picked" - the army is still in its corner base.
+func get_team_spawn_hexes(team: int) -> Array:
+	var cells: Array = team_spawn_hexes.get(team, [])
+	return cells.duplicate()
+
+
+## Moves team `team`'s live army dots into its chosen spawn hexes, evenly
+## divided, with each dot's home hex set to the hex it lands in (so the
+## stay-in-your-hex rule keeps the army there until it is ordered out).
+## Meant for the lobby, where the sim is not stepping - the relocation is
+## then simply what renders, and the player sees their army move to the
+## hexes they picked.
+func _relocate_team_army(team: int) -> void:
+	var hexes: Array = team_spawn_hexes.get(team, [])
+	if hexes.is_empty():
+		return
+	var player_teams := maxi(num_teams - 1, 1)
+	var army := mini(_dots_per_team * player_teams, instance_count)
+	# Ids are dealt round-robin (id % player_teams == team), so a team's slots
+	# are every player_teams-th id - no per-team id lists needed.
+	var ids: Array = []
+	var id := team
+	while id < army:
+		ids.append(id)
+		id += player_teams
+	var counts := split_spawn_counts(ids.size(), hexes.size())
+	# Dots are placed inside 75% of the hex's circumradius so none of them
+	# start past the wall of their own hex.
+	var spread := hex_size * mesh_scale * 0.75
+	var cursor := 0
+	var placed: Array = []
+	var checks: Array = []
+	for h in range(hexes.size()):
+		var cell: Vector2i = hexes[h]
+		# get_hex_center returns the terrain height at the centre: one ground
+		# sample per hex instead of one per dot.
+		var center := get_hex_center(cell.x, cell.y)
+		var hex_id := hex_to_id(cell.x, cell.y)
+		var first_id := -1
+		for p in spawn_positions_in_hex(center, spread, counts[h]):
+			if cursor >= ids.size():
+				break
+			var pos: Vector3 = p
+			var boid_id: int = ids[cursor]
+			cursor += 1
+			if first_id < 0:
+				first_id = boid_id
+			_write_boid_row(boid_id, _boid_row(pos, team, 1000, hex_id))
+		placed.append(counts[h])
+		checks.append(_verify_placed(first_id, cell, hex_id, spread))
+	print("Sim: team %d spawns in %d hex(es) %s - dots split %s | read back: %s"
+			% [team, hexes.size(), str(hexes), str(placed), str(checks)])
+
+
+## Reads one dot back out of the state buffer and reports whether it really
+## landed in the hex it was written to (position inside the hex, owning hex
+## id matching). Cheap - one 16-byte readback per hex - and it turns "the
+## army moved" from a claim into something the log states outright.
+func _verify_placed(boid_id: int, cell: Vector2i, hex_id: int, spread: float) -> String:
+	if boid_id < 0 or rd == null:
+		return "no dot"
+	var row := rd.buffer_get_data(state_buffers[frame_parity], boid_id * 64, 64)
+	if row.size() < 64:
+		return "unreadable"
+	var pos := Vector3(row.decode_float(0), row.decode_float(4), row.decode_float(8))
+	var center := get_hex_center(cell.x, cell.y)
+	var off_hex := Vector2(pos.x - center.x, pos.z - center.z).length() > spread + 0.01
+	if row.decode_u32(12) != hex_id:
+		return "(%d,%d) WRONG HEX" % [cell.x, cell.y]
+	if off_hex:
+		return "(%d,%d) OFF HEX" % [cell.x, cell.y]
+	return "(%d,%d) ok" % [cell.x, cell.y]
 
 
 func _make_uniform(binding: int, rid: RID) -> RDUniform:
@@ -700,12 +845,33 @@ func _build_push_constants(delta: float) -> PackedByteArray:
 	return bytes
 
 
+## Opens the lobby gate: sim time starts from ZERO here, because everything
+## time-based (path expiry, blast ages, mine lifetimes, desertion pacing) is
+## measured against _elapsed_seconds and lobby time is not match time.
+## Idempotent - the main screen can call it more than once.
+func start_game() -> void:
+	if game_started:
+		return
+	game_started = true
+	_elapsed_seconds = 0.0
+	_econ_timer = 0.0
+	# Safety net: re-apply every team's spawn picks right before the sim takes
+	# over, so a pick that arrived while the lobby was open is guaranteed to
+	# be in effect no matter what order things happened in.
+	for t in team_spawn_hexes.keys():
+		_relocate_team_army(int(t))
+
+
 func _process(delta: float) -> void:
-	_elapsed_seconds += delta
-	_econ_timer += delta
-	if _econ_timer >= 1.0:
-		_econ_timer -= 1.0
-		_economy_tick()
+	# Lobby gate: while the host hasn't started the match, keep rendering the
+	# (unmoving) army so joining players see the map, but step nothing.
+	var simulate := game_started
+	if simulate:
+		_elapsed_seconds += delta
+		_econ_timer += delta
+		if _econ_timer >= 1.0:
+			_econ_timer -= 1.0
+			_economy_tick()
 	var read_i = frame_parity
 	var write_i = 1 - frame_parity
 
@@ -718,7 +884,8 @@ func _process(delta: float) -> void:
 
 	var push_bytes := _build_push_constants(delta)
 	# Special miners: respawn dead guards on a timer (cheap CPU check).
-	_update_miners(delta)
+	if simulate:
+		_update_miners(delta)
 
 	var cl = rd.compute_list_begin()
 
@@ -740,11 +907,15 @@ func _process(delta: float) -> void:
 	rd.compute_list_dispatch(cl, total_groups, 1, 1)
 	rd.compute_list_add_barrier(cl)
 
-	rd.compute_list_bind_compute_pipeline(cl, pipeline_rids["sim"])
-	rd.compute_list_bind_uniform_set(cl, uniform_sets_sim[read_i], 0)
-	rd.compute_list_set_push_constant(cl, push_bytes, push_bytes.size())
-	rd.compute_list_dispatch(cl, total_groups, 1, 1)
-	rd.compute_list_add_barrier(cl)
+	# The sim pass itself is what the lobby gate withholds: skipping it leaves
+	# every boid exactly where the seed put it. count/prefixsum/scatter still
+	# run so the following render pass has valid cell data to draw them from.
+	if simulate:
+		rd.compute_list_bind_compute_pipeline(cl, pipeline_rids["sim"])
+		rd.compute_list_bind_uniform_set(cl, uniform_sets_sim[read_i], 0)
+		rd.compute_list_set_push_constant(cl, push_bytes, push_bytes.size())
+		rd.compute_list_dispatch(cl, total_groups, 1, 1)
+		rd.compute_list_add_barrier(cl)
 
 	rd.compute_list_bind_compute_pipeline(cl, pipeline_rids["render"])
 	rd.compute_list_bind_uniform_set(cl, uniform_sets_render[read_i], 0)
@@ -787,6 +958,13 @@ func _exit_tree() -> void:
 	rd.free_rid(econ_stats_rid)
 	rd.free_rid(collapse_rid)
 	rd.free_rid(explode_buf_rid)
+	# Both created in _create_buffers and previously never freed: cell_info
+	# (~330 KB) and the global path table (num_cells * num_teams * 1368 B,
+	# several MB). Harmless at app quit, a real leak on any scene reload.
+	if cell_info_rid.is_valid():
+		rd.free_rid(cell_info_rid)
+	if global_paths_rid.is_valid():
+		rd.free_rid(global_paths_rid)
 	if heightmap_rid.is_valid():
 		rd.free_rid(heightmap_rid)
 	for rid in _heightmap_retired:
@@ -840,6 +1018,17 @@ func world_to_hex(world_pos: Vector2) -> Vector2i:
 
 func hex_to_id(col: int, row: int) -> int:
 	return (col - hex_min_q) + (row - hex_min_r) * hex_width
+
+
+## Hex ids are used as OFFSETS into the GPU path table, so they must be
+## clamped before use. world_to_hex() does not clamp, and a drawn path can
+## start slightly outside the hex layout (the phone extrapolates grid space
+## to world space), which produced a NEGATIVE id - and a negative offset
+## passes the "offset + size <= total" upper-bound check the path writers
+## used, reaching buffer_update() as an invalid parameter.
+func _clamp_hex_id(id: int) -> int:
+	var total := hex_total_cells if hex_total_cells > 0 else (hex_grid_width * hex_grid_depth)
+	return clampi(id, 0, maxi(total - 1, 0))
 
 
 func id_to_hex(id: int) -> Vector2i:
@@ -1120,6 +1309,15 @@ func get_ground_height(x: float, z: float) -> float:
 ## Reading the whole 2 KB list is nothing; there is no need for a count or
 ## a clear - timestamp filtering does all the work.
 func read_explosions() -> void:
+	# THROTTLED: buffer_get_data is a synchronous GPU->CPU readback and stalls
+	# the pipe, so doing it every frame cost more than the whole rest of the
+	# CPU side. Nothing is lost by polling slower - slot timestamps are only
+	# ever compared against the previous read, so any blast that happened
+	# since then is still reported, and the poll stays far below the visual's
+	# BLAST_TTL so charge-up effects never look late.
+	if _elapsed_seconds - _explode_poll_time < EXPLODE_POLL_INTERVAL:
+		return
+	_explode_poll_time = _elapsed_seconds
 	var now := floorf(_elapsed_seconds * 256.0)
 	var data := rd.buffer_get_data(explode_buf_rid, 0, EXPLODE_SLOTS * 16)
 	if data.size() < EXPLODE_SLOTS * 16:
@@ -1209,13 +1407,22 @@ func _economy_tick() -> void:
 	# are credited the same second they happen (the old code paid a cached
 	# placement-time owner that never changed).
 	var _special_owner := -1  # set in the loop below when the special mine pays out
+	# ONE bulk readback of the whole cell_info table for the entire tick.
+	# buffer_get_data is a synchronous GPU->CPU stall, and the old code did a
+	# separate one per mine per second - a map with a few hundred mines spent
+	# hundreds of stalls a second reading four bytes each.
+	var cell_words := rd.buffer_get_data(cell_info_rid, 0, table_size * 8)
+	var have_cell_words := cell_words.size() >= table_size * 8
 	for cell in _active_mines.keys():
 		var mine: Dictionary = _active_mines[cell]
 		# Live packed building word: team-0 slice, +4 skips the hex_id word.
-		var live := rd.buffer_get_data(cell_info_rid, (cell.y * grid_dims.x + cell.x) * 8 + 4, 4)
+		# Clamped: the special mine's recorded cell is computed without one.
+		var cx := clampi(cell.x, 0, grid_dims.x - 1)
+		var cz := clampi(cell.y, 0, grid_dims.z - 1)
+		var word_off := (cz * grid_dims.x + cx) * 8 + 4
 		var owner := -1
-		if live.size() >= 4:
-			var packed_live: int = live.decode_u32(0)
+		if have_cell_words:
+			var packed_live: int = cell_words.decode_u32(word_off)
 			if (packed_live & 0xFF) == 1 and (packed_live & BUILDING_BUILT_FLAG) != 0:
 				var bt: int = (packed_live >> 8) & 0xFF
 				if bt != 0xFF:
@@ -1271,13 +1478,18 @@ func _economy_tick() -> void:
 	flags.resize(num_teams * 3 * 4)
 	for t in range(num_teams):
 		_team_resources[t] += income[t] - upkeep[t]
-		var deficit := 0.0
-		if _team_resources[t] < 0.0:
-			deficit = -_team_resources[t]       # cumulative debt (always > 0)
-			_team_resources[t] = 0.0            # visible pool floors at zero
+		# The pool is NOT floored at zero: the balance IS the running debt,
+		# which is the whole point of the mechanic - sim.glsl scales the
+		# desertion chance by this number, so a mildly broke team leaks units
+		# slowly and one drowning in debt collapses, and earning more than
+		# upkeep pays the balance back toward zero. Flooring it (the old
+		# behavior) capped the deficit at a single tick's shortfall, so every
+		# broke team converted at exactly the same constant rate and the
+		# phone never showed the negative counter players are meant to watch.
+		var balance: float = _team_resources[t]
+		if balance < 0.0:
 			flags.encode_u32(t * 3 * 4 + 4, 1)  # starve: sim bleeds boid health
-		if deficit > 0.0:
-			flags.encode_float(t * 3 * 4 + 8, deficit)
+			flags.encode_float(t * 3 * 4 + 8, -balance)  # cumulative debt
 
 	# NPC horde pays no upkeep: deserters are hostile wanderers living off
 	# the land. The revive loop below naturally skips them (no barracks and
@@ -1290,31 +1502,28 @@ func _economy_tick() -> void:
 	# THEN production: each built barrack spawns BARRACK_PROD_RATE fresh
 	# dots per second from unused slots (id >= live army size), same price
 	# per dot. Barracks therefore both replace losses and grow the army.
-	var barracks := []
+	# EVERY barrack produces from its OWN position - the count used to be
+	# multiplied per team and then all dots appeared at one arbitrary
+	# barrack, so a second barrack charged full price and produced nothing.
+	var sites_by_team := _barrack_sites_by_team()
 	for t in range(num_teams):
-		barracks.append(0)
-	for cell in _building_sites.keys():
-		var packed: int = _building_sites[cell].packed
-		if (packed & 0xFF) == 0 and (packed & BUILDING_BUILT_FLAG) != 0:
-			barracks[clampi((packed >> 8) & 0xFF, 0, num_teams - 1)] += 1
-	for t in range(num_teams):
+		var sites: Array = sites_by_team[t]
+		if sites.is_empty():
+			continue  # no barrack: nothing can spawn or revive for this team
 		var dead_id := stats.decode_u32((t * 2 + 1) * 4) if stats.size() >= 2 * num_teams * 4 else 0
-		if barracks[t] > 0 and dead_id != 0 and _team_resources[t] >= BARRACK_REVIVE_COST:
+		if dead_id != 0 and _team_resources[t] >= BARRACK_REVIVE_COST:
 			_team_resources[t] -= BARRACK_REVIVE_COST
-			_revive_boid(t, dead_id - 1)
-		# --- new-dot production ---
-		if barracks[t] <= 0:
-			continue  # no barrack: nothing can spawn for this team
-		var prod: int = barracks[t] * BARRACK_PROD_RATE
-		while prod > 0 and _team_resources[t] >= BARRACK_REVIVE_COST \
-				and _next_free_slot[t] < _army_slot_cap:
-			_team_resources[t] -= BARRACK_REVIVE_COST
-			# _revive_boid spawns into the given slot at the team's first
-			# barrack; production slots (>= army size) were never alive, so
-			# no overlap with the revive pool can happen.
-			_revive_boid(t, _next_free_slot[t])
-			_next_free_slot[t] += 1
-			prod -= 1
+			_revive_boid(t, dead_id - 1, _nearest_site(sites, _boid_last_position(dead_id - 1)))
+		# --- new-dot production, per barrack ---
+		for site_world in sites:
+			var prod: int = BARRACK_PROD_RATE
+			while prod > 0 and _team_resources[t] >= BARRACK_REVIVE_COST \
+					and _slot_cursor() < _army_slot_cap:
+				_team_resources[t] -= BARRACK_REVIVE_COST
+				# Production slots (>= army size) were never alive, so no
+				# overlap with the revive pool can happen.
+				_revive_boid(t, _take_free_slot(), site_world)
+				prod -= 1
 
 	rd.buffer_update(econ_res_rid, 0, flags.size(), flags)
 
@@ -1368,54 +1577,128 @@ func set_dot_count_per_team(n: int) -> void:
 		n = instance_count / maxi(num_teams - 1, 1)
 	_dots_per_team = n
 
-func _revive_boid(team: int, boid_id: int) -> void:
-	if boid_id < 0 or boid_id >= instance_count:
-		return
-	var barrack_pos := Vector2.ZERO
-	var found := false
+## The next unclaimed production slot. Slots come from ONE shared pool -
+## every team's watermark starts at the end of the seeded army - so they
+## must be handed out from the highest watermark, not per team. Allocating
+## per team independently made two producing teams write the SAME slot
+## every second: the later buffer_update won, so each team's growth
+## silently cancelled the other's (and the slot's team byte flipped).
+func _slot_cursor() -> int:
+	var cursor := 0
+	for t in range(_next_free_slot.size()):
+		cursor = maxi(cursor, _next_free_slot[t])
+	return cursor
+
+
+## Claims the next shared production slot and advances every team's
+## watermark past it, so the next claim - whichever team makes it - lands
+## on a different slot.
+func _take_free_slot() -> int:
+	var slot := _slot_cursor()
+	for t in range(_next_free_slot.size()):
+		_next_free_slot[t] = slot + 1
+	return slot
+
+
+## Per-team list of BUILT barrack world positions (XZ). The economy tick
+## produces from every one of them, so a team with several barracks grows
+## dots at each - the old code always spawned at whichever barrack the
+## dictionary happened to yield first.
+func _barrack_sites_by_team() -> Array:
+	var out: Array = []
+	for t in range(num_teams):
+		out.append([])
 	for cell in _building_sites.keys():
 		var packed: int = _building_sites[cell].packed
-		if (packed & 0xFF) == 0 and (packed & BUILDING_BUILT_FLAG) != 0 \
-				and ((packed >> 8) & 0xFF) == team:
-			barrack_pos = _building_sites[cell].world
-			found = true
-			break
-	if not found:
+		if (packed & 0xFF) == 0 and (packed & BUILDING_BUILT_FLAG) != 0:
+			var t := clampi((packed >> 8) & 0xFF, 0, num_teams - 1)
+			out[t].append(_building_sites[cell].world)
+	return out
+
+
+## The site in `sites` closest to `at` - used so a revived dot comes back
+## at the barrack nearest where it died rather than across the map.
+func _nearest_site(sites: Array, at: Vector2) -> Vector2:
+	var best: Vector2 = sites[0]
+	var best_d := best.distance_squared_to(at)
+	for i in range(1, sites.size()):
+		var d: float = (sites[i] as Vector2).distance_squared_to(at)
+		if d < best_d:
+			best_d = d
+			best = sites[i]
+	return best
+
+
+## Jittered spawn position for a dot produced by the barrack at
+## `barrack_world`, resting on the terrain surface. Split out of
+## _revive_boid so the ordering that matters - the Z jitter MUST be decided
+## before the ground sample - is testable without a RenderingDevice:
+## reading the ground height first sampled z = 0, which buried or floated
+## every produced/revived dot on hilly terrain.
+func _barrack_spawn_position(barrack_world: Vector2) -> Vector3:
+	var sx := barrack_world.x + randf_range(-2.0, 2.0)
+	var sz := barrack_world.y + randf_range(-2.0, 2.0)
+	return Vector3(sx, get_ground_height(sx, sz), sz)
+
+
+## Revives/creates the dot in slot `boid_id` for `team` at the given
+## barrack's world position (XZ). Callers pass the barrack that paid for
+## it - see _economy_tick.
+func _revive_boid(team: int, boid_id: int, barrack_world: Vector2) -> void:
+	if boid_id < 0 or boid_id >= instance_count:
 		return
-	var floats_per_boid := 16
-	var row := PackedFloat32Array()
-	row.resize(floats_per_boid)
-	row[0] = barrack_pos.x + randf_range(-2.0, 2.0)
-	row[1] = get_ground_height(row[0], row[2])
-	row[2] = barrack_pos.y + randf_range(-2.0, 2.0)
-	row[3] = 0.0
-	# vel = 0
-	row[4] = 0.0; row[5] = 0.0; row[6] = 0.0; row[7] = 0.0
-	row[8] = 0.0  # state
-	var np := PackedByteArray()
-	np.resize(4)
-	np.encode_u32(0, 0xFFFFFFFF)
-	row[9] = np.decode_float(0)
-	row[10] = 0.0
-	var tb := PackedByteArray()
-	tb.resize(4)
-	tb.encode_u32(0, team)
-	row[11] = tb.decode_float(0)
-	var hp := PackedByteArray()
-	hp.resize(4)
-	hp.encode_u32(0, 1000)
-	row[12] = hp.decode_float(0)
+	var spawn := _barrack_spawn_position(barrack_world)
 	# Home hex = the hex the barrack stands in, NOT 0: a hardcoded 0 made
 	# revived/produced dots walk to hex 0's center after their first fight.
-	var spawn_hex := world_to_hex(barrack_pos)
-	var hh := PackedByteArray()
-	hh.resize(4)
-	hh.encode_s32(0, hex_to_id(spawn_hex.x, spawn_hex.y))
-	row[13] = hh.decode_float(0)
-	var buf := row.to_byte_array()
-	var byte_offset := boid_id * floats_per_boid * 4
+	var spawn_hex := world_to_hex(Vector2(spawn.x, spawn.z))
+	_write_boid_row(boid_id, _boid_row(spawn, team, 1000, hex_to_id(spawn_hex.x, spawn_hex.y)))
+
+
+## One 64-byte BoidState row, built with explicit bit packing. THE single
+## place that knows the GPU layout - the seeding, revives and miners all go
+## through here, so the three can't drift apart (packing an int straight
+## into a float slot once made the special miners spawn as plain dots).
+## `pos_w` is scratch as far as the shader is concerned (it only ever reads
+## pos.xyz); the CPU keeps the owning hex id there, as the seed does.
+func _boid_row(pos: Vector3, team: int, health: int, home_hex_id: int,
+		state: int = 0, path_hex: int = NO_PATH, path_slot: int = 0) -> PackedByteArray:
+	var row := PackedByteArray()
+	row.resize(64)  # std430 BoidState = 16 floats
+	var hex := world_to_hex(Vector2(pos.x, pos.z))
+	row.encode_float(0, pos.x)
+	row.encode_float(4, pos.y)
+	row.encode_float(8, pos.z)
+	row.encode_u32(12, hex_to_id(hex.x, hex.y))
+	# vel (16..28) stays zero
+	row.encode_u32(32, state)
+	row.encode_u32(36, path_hex)
+	row.encode_u32(40, path_slot)
+	row.encode_u32(44, team)
+	row.encode_u32(48, health)
+	row.encode_s32(52, home_hex_id)
+	return row
+
+
+## Copies one prepared BoidState row into BOTH ping-pong state buffers, so
+## the slot is consistent no matter which one is read next frame.
+func _write_boid_row(boid_id: int, row: PackedByteArray) -> void:
+	var byte_offset := boid_id * row.size()
 	for sbuf in state_buffers:
-		rd.buffer_update(sbuf, byte_offset, buf.size(), buf)
+		rd.buffer_update(sbuf, byte_offset, row.size(), row)
+
+## CPU-side read of one boid slot's last known world position (XZ). Used to
+## pick the revive barrack nearest a dead dot. Falls back to the origin when
+## the slot has no usable position yet, which _nearest_site handles fine
+## (every distance is then measured from the same point).
+func _boid_last_position(boid_id: int) -> Vector2:
+	if boid_id < 0 or boid_id >= instance_count or rd == null:
+		return Vector2.ZERO
+	var data := rd.buffer_get_data(state_buffers[frame_parity], boid_id * 64, 12)
+	if data.size() < 12:
+		return Vector2.ZERO
+	var p := Vector2(data.decode_float(0), data.decode_float(8))
+	return p if p.is_finite() else Vector2.ZERO
+
 
 ## Cheap CPU-side liveness probe for one boid slot (reads just the health
 ## word, 4 bytes). Used for the special miners.
@@ -1455,40 +1738,14 @@ func setup_special_mine(world_pos: Vector2) -> void:
 func _spawn_miner(boid_id: int, ring: float) -> void:
 	if boid_id < 0 or boid_id >= instance_count:
 		return
-	var floats_per_boid := 16
-	var row := PackedFloat32Array()
-	row.resize(floats_per_boid)
-	var ang := TAU * float(boid_id % 7) / 7.0 + 0.45
+	var ang := TAU * float(boid_id % MINER_COUNT) / float(MINER_COUNT) + 0.45
 	var pos_x := _special_mine_world.x + cos(ang) * (hex_size * mesh_scale * 0.55) * ring
 	var pos_z := _special_mine_world.y + sin(ang) * (hex_size * mesh_scale * 0.55) * ring
-	row[0] = pos_x
-	row[1] = get_ground_height(pos_x, pos_z)
-	row[2] = pos_z
-	row[3] = 0.0
-	row[4] = 0.0; row[5] = 0.0; row[6] = 0.0; row[7] = 0.0
-	# state: miner. MUST be bit-packed like every other uint field here:
-	# assigning the int directly stored float 128.0 (bits 0x43000000), which
-	# shares NO bits with STATE_MINER (0x80). The 7 miners therefore spawned
-	# as plain NPC dots - gray "deserters" roaming out of the map center -
-	# instead of gold, hex-locked miners (the sim's miner early-out never
-	# fired, so nothing re-set the flag either).
-	var sb := PackedByteArray()
-	sb.resize(4)
-	sb.encode_u32(0, STATE_MINER_FLAG)
-	row[8] = sb.decode_float(0)
-	var np := PackedByteArray(); np.resize(4); np.encode_u32(0, 0xFFFFFFFF)
-	row[9] = np.decode_float(0)  # no path
-	row[10] = 0.0                # slot
-	var tb := PackedByteArray(); tb.resize(4); tb.encode_u32(0, num_teams - 1)
-	row[11] = tb.decode_float(0)  # NPC team: no upkeep/desertion/capture
-	var hp := PackedByteArray(); hp.resize(4); hp.encode_u32(0, MINER_HEALTH)
-	row[12] = hp.decode_float(0)
-	var hh := PackedByteArray(); hh.resize(4); hh.encode_s32(0, _special_mine_hex_id)
-	row[13] = hh.decode_float(0)  # home = the mine's hex
-	var buf := row.to_byte_array()
-	var byte_offset := boid_id * floats_per_boid * 4
-	for sbuf in state_buffers:
-		rd.buffer_update(sbuf, byte_offset, buf.size(), buf)
+	var pos := Vector3(pos_x, get_ground_height(pos_x, pos_z), pos_z)
+	# NPC team (no upkeep/desertion/capture) + the miner state flag, which the
+	# sim uses to hex-lock them and keep them gold. Home = the mine's hex.
+	_write_boid_row(boid_id, _boid_row(pos, num_teams - 1, MINER_HEALTH,
+			_special_mine_hex_id, STATE_MINER_FLAG))
 
 ## Called from _process: respawns dead miners at the mine on a timer.
 func _update_miners(delta: float) -> void:
@@ -1609,7 +1866,7 @@ func clear_building_at_hex(world_pos: Vector2) -> void:
 ## Set the number of available paths stored for a given hex cell and team.
 func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:
 	team = clampi(team, 0, num_teams - 1)
-	var hex_id := hex_to_id(col, row)
+	var hex_id := _clamp_hex_id(hex_to_id(col, row))
 	var team_hex_key := "%d_%d" % [hex_id, team]
 	_hex_path_counts[team_hex_key] = path_count
 
@@ -1627,7 +1884,7 @@ func set_hex_path_count(col: int, row: int, team: int, path_count: int) -> void:
 ## only NEW claims - boids already following a path finish it.
 func set_path_fraction(col: int, row: int, team: int, fraction: float) -> void:
 	team = clampi(team, 0, num_teams - 1)
-	var hex_id := hex_to_id(col, row)
+	var hex_id := _clamp_hex_id(hex_to_id(col, row))
 	var team_hex_idx := hex_id * num_teams + team
 	var offset := team_hex_idx * 1368 + 4  # claim_chance sits after path_count
 	var total_max := (hex_total_cells if hex_total_cells > 0 else hex_grid_width * hex_grid_depth) * num_teams * 1368
@@ -1666,7 +1923,7 @@ func set_path(points: Array, col: int = 0, row: int = 0, team: int = 0, path_slo
 		col = start_hex.x
 		row = start_hex.y
 
-	var hex_id := hex_to_id(col, row)
+	var hex_id := _clamp_hex_id(hex_to_id(col, row))
 	var team_hex_key := "%d_%d" % [hex_id, team]
 
 	if path_slot < 0:
@@ -1788,7 +2045,12 @@ func _compute_team_bases() -> void:
 	# ring - they must hug the terrain's interior edge (grid-2) instead.
 	var ter_w := hex_grid_width
 	var ter_d := hex_grid_depth
-	var ms := get_tree().root.get_node_or_null("MainScreen")
+	# Tree-optional: headless tests call this outside the scene tree (where
+	# get_tree() is null), and the parent scan below still finds the main
+	# screen when there is one.
+	var ms: Node = null
+	if is_inside_tree():
+		ms = get_tree().root.get_node_or_null("MainScreen")
 	if ms == null:
 		var anc := get_parent()
 		while anc != null and ms == null:
@@ -1834,73 +2096,5 @@ func _compute_team_bases() -> void:
 ## be 0 or 1 (the live teams; team slots 2 and 3 are unused for now).
 ## This version builds a single boid row and copies it into the state buffer
 ## at the correct offset; it does NOT touch `init_state` directly.
-func _spawn_team_army(team: int) -> void:
-	# Collect spawn tiles for this team's corner base.
-	var base: Array = team_bases[team]
-	var spawn_tiles: Array = []
-	for c in range(base[0], base[2] + 1):
-		for r in range(base[1], base[3] + 1):
-			if c == base[0] and r == base[1]:
-				continue # skip the generator tile
-			spawn_tiles.append(Vector2i(c, r))
-
-	# Find all boids belonging to this team (boid i has team = i % player_teams).
-	var team_boids: Array = []
-	for i in range(_dots_per_team * (num_teams - 1)):
-		if i % (num_teams - 1) == team:
-			team_boids.append(i)
-
-	var jitter := mesh_scale * 0.3
-	var floats_per_boid := 16
-
-	for bi in range(team_boids.size()):
-		var boid_id: int = team_boids[bi]
-		var cell: Vector2i = spawn_tiles[bi % spawn_tiles.size()]
-		var center := get_hex_center(cell.x, cell.y)
-		var offset := Vector3(randf_range(-jitter, jitter), randf_range(0.0, 4.0), randf_range(-jitter, jitter))
-		var pos := center + offset
-
-		var hex := world_to_hex(Vector2(pos.x, pos.z))
-		var hex_id := hex_to_id(hex.x, hex.y)
-
-		var row := PackedFloat32Array()
-		row.resize(floats_per_boid)
-		row[0] = pos.x
-		row[1] = pos.y
-		row[2] = pos.z
-		var hb := PackedByteArray()
-		hb.resize(4)
-		hb.encode_u32(0, hex_id)
-		row[3] = hb.decode_float(0)
-		row[4] = 0.0
-		row[5] = 0.0
-		row[6] = 0.0
-		row[7] = 0.0
-		row[8] = 0.0
-		var np := PackedByteArray()
-		np.resize(4)
-		np.encode_u32(0, 0xFFFFFFFF)
-		row[9] = np.decode_float(0)
-		row[10] = 0.0
-		var tb := PackedByteArray()
-		tb.resize(4)
-		tb.encode_u32(0, team)
-		row[11] = tb.decode_float(0)
-		var hp := PackedByteArray()
-		hp.resize(4)
-		hp.encode_u32(0, 1000)
-		row[12] = hp.decode_float(0)
-		var shh := PackedByteArray()
-		shh.resize(4)
-		shh.encode_s32(0, hex_id)
-		row[13] = shh.decode_float(0)
-
-		var buf := row.to_byte_array()
-		var byte_offset := boid_id * floats_per_boid * 4
-		for sbuf in state_buffers:
-			rd.buffer_update(sbuf, byte_offset, buf.size(), buf)
-
-
-## Current per-team resource pools (for UIs). Index = team id.
 func get_team_resources() -> Array:
 	return _team_resources.duplicate()
