@@ -30,7 +30,7 @@ func _ready() -> void:
 	_build_team_badge()
 	_build_lobby_panel()
 	_build_resource_label()
-	#_build_palette()
+	_build_palette()
 	_build_fullscreen_button()
 
 
@@ -180,31 +180,44 @@ func _build_resource_label() -> void:
 	_resource_label.add_theme_constant_override("outline_size", 6)
 	add_child(_resource_label)
 
-
 func _build_palette() -> void:
 	var palette := PanelContainer.new()
 	palette.name = "BuildPalette"
-	palette.anchor_left = 0.0
+	
+	# Anchor to bottom-right corner
+	palette.anchor_left = 1.0
 	palette.anchor_right = 1.0
 	palette.anchor_top = 1.0
 	palette.anchor_bottom = 1.0
-	palette.offset_top = -PALETTE_HEIGHT
+	palette.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	palette.grow_vertical = Control.GROW_DIRECTION_BEGIN
+	
+	# Offset from the right (-16px margin) and bottom (-12px margin)
+	palette.offset_left = -16.0
+	palette.offset_right = -16.0
+	palette.offset_top = -PALETTE_HEIGHT * 0.75  # 25% smaller height
 	palette.offset_bottom = -12.0
+	
 	var row := HBoxContainer.new()
-	row.alignment = BoxContainer.ALIGNMENT_CENTER
-	row.add_theme_constant_override("separation", 24)
+	row.alignment = BoxContainer.ALIGNMENT_END
+	row.add_theme_constant_override("separation", 12) # Tightened spacing from 24
 	palette.add_child(row)
+	
 	for id in BuildingTypes.NAMES:
 		var chip := Button.new()
 		chip.text = BuildingTypes.name_of(id)
-		chip.custom_minimum_size = CHIP_SIZE
+		# Scale down chip dimensions
+		chip.custom_minimum_size = CHIP_SIZE * 0.75
 		chip.add_theme_color_override("font_color", BuildingTypes.color_of(id))
-		# button_down fires on press so the building is in hand while dragging.
+		
+		# Optionally shrink button font size if text clips
+		chip.add_theme_font_size_override("font_size", 12)
+		
 		chip.button_down.connect(func() -> void: building_picked.emit(id))
 		chip.mouse_default_cursor_shape = Control.CURSOR_DRAG
 		row.add_child(chip)
+		
 	add_child(palette)
-
 
 ## Web only: a tiny always-available fullscreen toggle (top-right). The
 ## browser's requestFullscreen must come from a user gesture, so a button
