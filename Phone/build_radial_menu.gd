@@ -11,9 +11,9 @@ extends Node2D
 ## cover the map the way a full-width palette bar could.
 
 ## Distance from the held point to each option's center.
-const MENU_RADIUS := 96.0
+const MENU_RADIUS := 10.0
 ## Radius of one option circle.
-const OPTION_RADIUS := 30.0
+const OPTION_RADIUS := 5.0
 ## Extra forgiving hit area around an option circle.
 const HIT_PADDING := 12.0
 ## Option angles (radians): up, upper-left, upper-right - ordered by
