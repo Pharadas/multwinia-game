@@ -354,24 +354,24 @@ func _can_remove_at(cell: Vector2i) -> bool:
 
 func _on_cell_tapped(cell: Vector2i) -> void:
 	charge_meter.hide_meter()
-	# Lobby: a tap picks a spawn hex for this army instead of selecting the
-	# tile - the match hasn't started, so there is nothing to order yet.
+	
 	if in_lobby:
 		toggle_spawn_pick(cell)
 		return
-	# A tap selects the hex: same-process tile call + network broadcast.
-	# (A tap is also the first half of the double-tap that arms the build
-	# menu - see PhoneInputController.)
-	_call_tile_function(cell.x, cell.y)
-	_send_click_over_network(cell)
-	# Double-tap on a WALL marks it for demolition (an X appears); another
-	# double-tap on the same wall unmarks it. Mines/barracks are untouched.
+
 	var now := Time.get_ticks_msec() / 1000.0
-	if cell == _last_tap_cell and now - _last_tap_time <= 0.4 \
-			and state.is_wall_at(cell) and state.building_at(cell) == BuildingTypes.REMOVE:
+	var is_double_tap := (cell == _last_tap_cell) and (now - _last_tap_time <= 0.45)
+
+	if is_double_tap and state.is_wall_at(cell):
 		_toggle_wall_delete(cell)
-	_last_tap_cell = cell
-	_last_tap_time = now
+		# Reset tracking so a third tap won't immediately count as another double-tap
+		_last_tap_cell = Vector2i(-1, -1)
+		_last_tap_time = 0.0
+	else:
+		_call_tile_function(cell.x, cell.y)
+		_send_click_over_network(cell)
+		_last_tap_cell = cell
+		_last_tap_time = now
 
 
 # Double-tap tracking for wall-demolition marks.
