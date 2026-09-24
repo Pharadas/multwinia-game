@@ -30,7 +30,7 @@ func _ready() -> void:
 	_build_team_badge()
 	_build_lobby_panel()
 	_build_resource_label()
-	_build_palette()
+	#_build_palette()
 	_build_fullscreen_button()
 
 

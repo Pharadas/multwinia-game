@@ -27,7 +27,9 @@ class_name HexGrid2DSocket
 ##   4. the exported `host` as a last resort
 ##   The scheme follows the page protocol: HTTPS pages dial wss:// (browsers
 ##   block ws:// from secure pages), HTTP pages dial ws://.
-## UDP LAN discovery is impossible in a browser, so it's skipped there.
+## UDP LAN discovery is impossible in a browser, so it's skipped there. A
+## browser phone instead SCANS for the game when the automatic target does
+## not answer - see the LAN AUTO-DISCOVERY FOR BROWSERS section below.
 
 ## Manually-set target - only used if use_lan_discovery is false, or as the
 ## last-known-good address discovery fills in once a reply arrives.
@@ -54,6 +56,30 @@ class_name HexGrid2DSocket
 ## does NOT retry on its own, so without this it just sits disconnected
 ## forever.
 @export var retry_interval: float = 1.0
+
+## --- LAN AUTO-DISCOVERY FOR BROWSERS ---
+## A browser can't broadcast the UDP discovery packet above, so a web phone
+## has no equivalent of it. What it CAN do is dial likely addresses
+## directly, and that is what these settings drive: once the automatic
+## target (normally the page's own host) has failed for SWEEP_START_DELAY,
+## the rest of that host's /24 is probed on the WebSocket port, so a phone
+## that loaded the page from anywhere on the same WiFi still finds a game
+## already running on it.
+##
+## Bounded on purpose: private IPv4 page hosts only (a public page host is a
+## CDN, with no LAN behind it to scan), probes in the page's own scheme
+## (http page -> ws://, https page -> wss://, because a secure page can
+## never open a ws://), a fixed number of probes in flight, per-probe and
+## total timeouts, and a cooldown before another pass.
+@export var enable_lan_sweep: bool = true
+const SWEEP_PARALLEL := 24
+const SWEEP_PROBE_TIMEOUT := 1.5
+const SWEEP_TOTAL_BUDGET := 25.0
+## Wait this long with the primary target down before scanning, so a game
+## that is merely still starting up isn't beaten to the punch by a sweep.
+const SWEEP_START_DELAY := 2.5
+## How long to wait before scanning again after a pass found nothing.
+const SWEEP_RESTART_DELAY := 30.0
 ## How many seconds to wait for a LAN discovery reply before giving up
 ## and falling back to connecting directly to `host` (127.0.0.1).
 ## On the same machine, UDP broadcasts to 255.255.255.255 often don't
@@ -71,6 +97,11 @@ signal team_resources_received(team: int, amount: float)
 ## Emitted whenever the WebSocket goes up or down (web builds). The UI uses
 ## it to show/hide the manual-connect screen.
 signal connection_state_changed(connected: bool)
+
+## Emitted when the browser starts / stops scanning the local network for a
+## game (see the sweep below). The UI shows "searching..." while it runs so
+## a player knows the phone is still trying on its own.
+signal lan_sweep_state_changed(searching: bool)
 
 ## Emitted when the main screen hands this phone its team, with that team's
 ## color (the main screen owns the palette - see its assigned_team_message()).
@@ -116,6 +147,23 @@ var _discovery_udp := PacketPeerUDP.new()
 var _discovery_elapsed := 0.0
 var _server_found := false
 var _discovery_total_elapsed := 0.0
+
+# --- browser LAN sweep state -------------------------------------------------
+## The page's own hostname, which is what the sweep is derived from. Cached:
+## it cannot change while the page lives, and JavaScriptBridge.eval isn't free.
+var _page_host_cache := ""
+## How long the primary target has been down, and how long until another
+## sweep pass is allowed.
+var _ws_down_elapsed := 0.0
+var _sweep_cooldown := 0.0
+var _sweep_active := false
+var _sweep_elapsed := 0.0
+var _sweep_queue: Array = []
+var _sweep_peers: Array[WebSocketPeer] = []
+var _sweep_hosts: Array = []
+var _sweep_ages: Array = []
+## Probes use the page's own scheme: a secure page can only speak wss.
+var _sweep_tls := false
 
 func _ready() -> void:
 	if _is_web:
@@ -271,10 +319,20 @@ func resolve_web_target(page_href: String, page_hostname: String,
 			port = websocket_port
 		return _target(host_param, port, page_https, true, "?host=")
 
-	# 3. The page's own hostname - plain-HTTP pages only (see the header).
-	if not page_https and not page_hostname.is_empty() \
-			and page_hostname != "localhost" and page_hostname != "127.0.0.1":
-		return _target(page_hostname, websocket_port, false, true, "page host")
+	# 3. The page's own hostname. A plain-HTTP page can only be served by
+	#    something on the LAN, so its host IS the game machine. An HTTPS page
+	#    counts too, but ONLY when its host is a private address - that is the
+	#    game serving the page over TLS on the LAN (a cert accepted once on
+	#    the phone); a public HTTPS hostname is a CDN and can never be the
+	#    game server. The scheme always follows the page: a browser refuses
+	#    ws:// from a secure page as mixed content.
+	if not page_hostname.is_empty() and page_hostname != "localhost" \
+			and page_hostname != "127.0.0.1":
+		if page_https:
+			if is_private_ipv4(page_hostname):
+				return _target(page_hostname, websocket_port, true, true, "page host (lan tls)")
+		else:
+			return _target(page_hostname, websocket_port, false, true, "page host")
 
 	# 4. The exported `host`, when a plain ws:// can actually leave the page.
 	if not page_https:
@@ -352,12 +410,16 @@ func _connect_websocket() -> void:
 		print("HexGrid2DSocket: WebSocket connect failed (error %d), retrying..." % err)
 
 func _process_websocket(delta: float) -> void:
+	_poll_lan_sweep(delta)
 	_ws.poll()
 	var state := _ws.get_ready_state()
 	if state == WebSocketPeer.STATE_OPEN:
 		if not _was_connected:
 			_was_connected = true
 			_ws_retry_elapsed = 0.0
+			# A game answered: drop any probes still in flight immediately.
+			_stop_lan_sweep()
+			_ws_down_elapsed = 0.0
 			print("HexGrid2DSocket: WebSocket connected to %s." % _ws_url)
 			emit_signal("connection_state_changed", true)
 			_ws.send_text(JSON.stringify({"type": "request_terrain"}))
@@ -370,6 +432,9 @@ func _process_websocket(delta: float) -> void:
 			print("HexGrid2DSocket: WebSocket closed - retrying every %.1fs." % retry_interval)
 			emit_signal("connection_state_changed", false)
 		_was_connected = false
+		# No game at the automatic target: start (or resume) scanning the
+		# local network. A no-op while a scan is running or cooling down.
+		_maybe_start_lan_sweep(delta)
 		_ws_retry_elapsed += delta
 		if _ws_retry_elapsed >= retry_interval:
 			_ws_retry_elapsed = 0.0
@@ -378,6 +443,190 @@ func _process_websocket(delta: float) -> void:
 func _ws_send(msg: Dictionary) -> void:
 	if _is_web and _ws.get_ready_state() == WebSocketPeer.STATE_OPEN:
 		_ws.send_text(JSON.stringify(_jsonify(msg)))
+
+# --- browser LAN sweep -------------------------------------------------------
+
+## True while the browser is scanning the local network for a game. The
+## connect screen shows "searching..." instead of a retry address while it
+## runs, so a player knows the phone is still trying on its own.
+func is_sweeping() -> bool:
+	return _sweep_active
+
+
+## The page's own hostname, cached - the LAN sweep derives its subnet from
+## it (a page loaded from the game machine or any other LAN host names the
+## network the game is on).
+func _page_hostname() -> String:
+	if _page_host_cache.is_empty() and _is_web:
+		_page_host_cache = str(JavaScriptBridge.eval("window.location.hostname", true))
+	return _page_host_cache
+
+
+## The addresses worth probing for a game already running on the LAN, given
+## the page's own hostname. Only the page host's own /24, and only when that
+## host is a private IPv4 literal: a game is on the LAN, so a page that
+## loaded from the LAN names the right subnet, while a public or HTTPS page
+## tells us nothing (and on HTTPS pages every ws:// is blocked anyway).
+## `skip` drops addresses already being used - normally the one the socket
+## is already retrying. Returns [] when there is nothing sensible to sweep.
+## Static and browser-free so Tests/connect_resolve.gd can drive it.
+static func sweep_candidates(page_host: String, skip: Array = []) -> Array:
+	var parts := page_host.split(".")
+	if parts.size() != 4:
+		return []  # hostname, IPv6 literal, or nothing at all
+	for p in parts:
+		if not p.is_valid_int() or int(p) < 0 or int(p) > 255:
+			return []
+	if not is_private_ipv4(page_host):
+		return []  # public address: there is no LAN behind it to scan
+	var out: Array = []
+	var prefix := "%s.%s.%s." % [parts[0], parts[1], parts[2]]
+	for last in range(1, 255):
+		var candidate: String = prefix + str(last)
+		if candidate != page_host and not skip.has(candidate):
+			out.append(candidate)
+	return out
+
+
+## True for the IPv4 ranges a home/office LAN uses (RFC 1918 + CGNAT).
+## Kept local instead of sharing the main screen's copy: the web export must
+## not depend on a MainScreen script (that class may not ship in the pck).
+static func is_private_ipv4(addr: String) -> bool:
+	var parts := addr.split(".")
+	if parts.size() != 4:
+		return false
+	for p in parts:
+		if not p.is_valid_int():
+			return false
+		var v := int(p)
+		if v < 0 or v > 255:
+			return false
+	var a := int(parts[0])
+	if a == 10:
+		return true
+	if a == 192 and int(parts[1]) == 168:
+		return true
+	if a == 172 and int(parts[1]) >= 16 and int(parts[1]) <= 31:
+		return true
+	return a == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127
+
+
+## Starts a scan once the automatic target has been down for
+## SWEEP_START_DELAY. Called every frame while disconnected; a no-op while a
+## scan is running or cooling down, and while the player has dialed an
+## address by hand (their choice beats any scan).
+func _maybe_start_lan_sweep(delta: float) -> void:
+	_ws_down_elapsed += delta
+	if _sweep_active or not enable_lan_sweep or not _is_web:
+		return
+	if _sweep_cooldown > 0.0:
+		_sweep_cooldown -= delta
+		return
+	if _ws_down_elapsed < SWEEP_START_DELAY or not remote_host_override.is_empty():
+		return
+	var resolved := resolve_web_target(
+			str(JavaScriptBridge.eval("window.location.href", true)),
+			_page_hostname(),
+			str(JavaScriptBridge.eval("window.location.protocol", true)))
+	var current := str(resolved.host)
+	_sweep_tls = bool(resolved.tls)
+	var candidates := sweep_candidates(_page_hostname(), [current])
+	if candidates.is_empty():
+		# Nothing worth scanning on this page (public/HTTPS host). Wait out
+		# the cooldown so the check itself stays cheap.
+		_sweep_cooldown = SWEEP_RESTART_DELAY
+		_ws_down_elapsed = 0.0
+		return
+	_sweep_active = true
+	_sweep_elapsed = 0.0
+	_sweep_queue = candidates
+	print("HexGrid2DSocket: nothing at %s - scanning the local network for a game (%d addresses)..." % [current, candidates.size()])
+	emit_signal("lan_sweep_state_changed", true)
+
+
+## Drives the probe pool: keeps SWEEP_PARALLEL probes in flight, retires the
+## ones that failed or timed out, adopts the FIRST address that answers with
+## an open WebSocket and drops the rest of the scan.
+func _poll_lan_sweep(delta: float) -> void:
+	if not _sweep_active:
+		return
+	_sweep_elapsed += delta
+	while _sweep_peers.size() < SWEEP_PARALLEL and not _sweep_queue.is_empty():
+		var next_host: String = _sweep_queue.pop_front()
+		var peer := WebSocketPeer.new()
+		# These probes only ever carry a handshake - tiny buffers are enough.
+		peer.inbound_buffer_size = 4096
+		peer.outbound_buffer_size = 4096
+		if peer.connect_to_url("%s://%s:%d" % ["wss" if _sweep_tls else "ws", next_host,
+				websocket_port]) != OK:
+			continue  # malformed address: never worth retrying
+		_sweep_peers.append(peer)
+		_sweep_hosts.append(next_host)
+		_sweep_ages.append(0.0)
+
+	var kept_peers: Array[WebSocketPeer] = []
+	var kept_hosts: Array = []
+	var kept_ages: Array = []
+	for i in _sweep_peers.size():
+		var peer: WebSocketPeer = _sweep_peers[i]
+		peer.poll()
+		var age: float = _sweep_ages[i] + delta
+		match peer.get_ready_state():
+			WebSocketPeer.STATE_OPEN:
+				_adopt_lan_game(str(_sweep_hosts[i]))
+				return
+			WebSocketPeer.STATE_CONNECTING:
+				if age < SWEEP_PROBE_TIMEOUT:
+					kept_peers.append(peer)
+					kept_hosts.append(_sweep_hosts[i])
+					kept_ages.append(age)
+				else:
+					peer.close()  # no answer in time - not a game
+			_:
+				pass  # CLOSED: refused, absent or blocked, all the same here
+	_sweep_peers = kept_peers
+	_sweep_hosts = kept_hosts
+	_sweep_ages = kept_ages
+
+	if _sweep_queue.is_empty() and _sweep_peers.is_empty():
+		print("HexGrid2DSocket: no game found on the local network.")
+		_stop_lan_sweep(false)
+	elif _sweep_elapsed >= SWEEP_TOTAL_BUDGET:
+		print("HexGrid2DSocket: local network scan timed out after %.0fs." % SWEEP_TOTAL_BUDGET)
+		_stop_lan_sweep(false)
+
+
+## A probe answered: make that host the target and connect to it for real.
+## Going through parse_remote_target() means the found address also becomes
+## the session's target (and what the connect screen reports), instead of
+## being re-derived on the next retry.
+func _adopt_lan_game(found_host: String) -> void:
+	print("HexGrid2DSocket: found a game on the local network at %s - connecting." % found_host)
+	_stop_lan_sweep()
+	parse_remote_target(found_host, websocket_port)
+	reconnect_websocket()
+
+
+## Ends the current scan and closes every probe still in flight. `found`
+## false means the scan came up empty, which earns it a cooldown before the
+## next pass (a game may well be started later).
+func _stop_lan_sweep(found: bool = true) -> void:
+	for peer in _sweep_peers:
+		if peer.get_ready_state() != WebSocketPeer.STATE_CLOSED:
+			peer.close()
+	_sweep_peers.clear()
+	_sweep_hosts.clear()
+	_sweep_ages.clear()
+	_sweep_queue.clear()
+	_sweep_elapsed = 0.0
+	_sweep_tls = false
+	if _sweep_active:
+		_sweep_active = false
+		emit_signal("lan_sweep_state_changed", false)
+	if not found:
+		_sweep_cooldown = SWEEP_RESTART_DELAY
+		_ws_down_elapsed = 0.0
+
 
 ## Manual override from the UI: point the WebSocket at a typed address,
 ## then reconnect immediately. Accepts "IP", "IP:port", "ws://IP:port",
@@ -434,6 +683,10 @@ func reconnect_websocket() -> void:
 	if not _is_web:
 		return
 	_ws.close()
+	# The target is about to change, so any scan in flight is stale - and the
+	# failure clock restarts, since the fresh target deserves a clean try.
+	_stop_lan_sweep()
+	_ws_down_elapsed = 0.0
 	_ws_url = _resolve_web_url() # re-resolve: the target may have just changed
 	_ws_retry_elapsed = retry_interval # force an immediate reconnect attempt
 	_process_websocket(0.0)

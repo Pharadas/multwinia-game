@@ -98,6 +98,11 @@ var _lobby: CanvasLayer = null
 var _lobby_list: VBoxContainer = null
 var _lobby_status: Label = null
 var _lobby_start_button: Button = null
+## Live list of the addresses a phone can dial, refreshed once a second so
+## the UPnP public IP appears as soon as the router answers (it is resolved
+## on a worker thread after startup).
+var _lobby_addresses: Label = null
+var _address_timer := 0.0
 
 ## One walled corner base per team, computed dynamically from the ACTUAL
 ## grid size (see _compute_team_bases()) so the bases are always in the four
@@ -432,6 +437,18 @@ func _build_lobby() -> void:
 	_lobby_status.add_theme_color_override("font_color", Color(0.72, 0.74, 0.8))
 	box.add_child(_lobby_status)
 
+	var addr_title := Label.new()
+	addr_title.text = "PHONE CONNECT ADDRESSES"
+	addr_title.add_theme_font_size_override("font_size", 15)
+	addr_title.add_theme_color_override("font_color", Color(0.62, 0.64, 0.72))
+	box.add_child(addr_title)
+
+	_lobby_addresses = Label.new()
+	_lobby_addresses.add_theme_font_size_override("font_size", 15)
+	_lobby_addresses.add_theme_color_override("font_color", Color(0.72, 0.88, 0.78))
+	box.add_child(_lobby_addresses)
+	_refresh_addresses()
+
 	_lobby_start_button = Button.new()
 	_lobby_start_button.text = "START MATCH"
 	_lobby_start_button.add_theme_font_size_override("font_size", 20)
@@ -484,6 +501,48 @@ func _refresh_lobby() -> void:
 		_lobby_start_button.visible = not _match_started
 
 
+## Rebuilds the lobby's connection-address block: how a phone joins right
+## now, best route first. Deliberately spelled out as something a player can
+## read off the screen and type - a native phone, and any browser phone on
+## this WiFi, needs nothing but these lines.
+func _refresh_addresses() -> void:
+	if _lobby_addresses == null:
+		return
+	var socket := get_node_or_null("Socket")
+	var lan: Array = []
+	var ws_port := 9080
+	if socket != null:
+		if socket.has_method("get_lan_addresses"):
+			lan = socket.get_lan_addresses()
+		if "websocket_port" in socket:
+			ws_port = int(socket.websocket_port)
+	var lines: Array = []
+	# A phone that opens the page the GAME itself serves is the only route
+	# that needs no typing at all: the page's hostname IS the game machine,
+	# which the browser phone resolves to ws://<same host>:9080 by itself.
+	var web_server := get_node_or_null("WebFileServer")
+	var page_url := ""
+	if web_server != null and web_server.has_method("get_lan_url"):
+		page_url = str(web_server.get_lan_url())
+	if not page_url.is_empty():
+		lines.append("same WiFi   %s   (opens the game, connects itself)" % page_url)
+	if not lan.is_empty():
+		lines.append("phone / PC  ws://%s:%d" % [lan[0], ws_port])
+	var public_ip := ""
+	if socket != null and socket.has_method("get_public_ip"):
+		public_ip = str(socket.get_public_ip())
+	if not public_ip.is_empty():
+		lines.append("internet    ws://%s:%d   (router port forwarded)" % [public_ip, ws_port])
+	elif socket != null:
+		lines.append("internet    waiting for the router (UPnP)...")
+	var text := "\n".join(lines)
+	if text == _lobby_addresses.text:
+		return  # polled every second - only act when something changed
+	_lobby_addresses.text = text
+	# Also in the log: the host can read the addresses off either one.
+	print("Lobby: phone connect addresses -> %s" % text.replace("\n", " | "))
+
+
 ## Opens the lobby gate: the sim starts simulating from zero match time. The
 ## lobby panel stays as a roster, without the start button. Every team's
 ## spawn picks are pushed once more first, so the armies are standing where
@@ -499,6 +558,7 @@ func _start_match() -> void:
 		print("Lobby: match started with %d player(s) joined." % _joined_teams.size())
 	_refresh_lobby()
 	_broadcast_lobby_state()
+	_lobby.hide()
 
 
 ## Hands every team's chosen spawn hexes to the sim as world positions (the
@@ -1316,6 +1376,13 @@ func make_new_lattice_swarm(pos: Vector3, team: int, dot_count: int = 256) -> vo
 
 func _process(delta: float) -> void:
 	_update_path_visuals(delta)
+	# The addresses are cheap to rebuild but the UPnP public IP arrives on a
+	# worker thread at an unpredictable moment, so poll once a second rather
+	# than trying to hook that event.
+	_address_timer += delta
+	if _address_timer >= 1.0:
+		_address_timer = 0.0
+		_refresh_addresses()
 	# Keep the crate supply going: drop a new one every so often, but never
 	# stack multiple crates at once.
 	if hex_nodes.is_empty():

@@ -24,6 +24,9 @@ var port: int = 9095
 
 var _server := TCPServer.new()
 var _pending: Array[StreamPeerTCP] = []
+## The LAN address phones should use, resolved once at startup so the HUD
+## can print a ready-to-type URL instead of making players hunt for it.
+var _lan_ip := ""
 
 const MIME := {
 	"html": "text/html",
@@ -53,9 +56,35 @@ func _ready() -> void:
 		queue_free()
 		return
 	for ip in IP.get_local_addresses():
-		if ip.begins_with("192.168.") or ip.begins_with("10.") or ip.count(".") == 3 and not ip.begins_with("127.") and not ip.begins_with("169.254."):
+		if _usable_lan_ip(ip):
+			_lan_ip = ip
 			print("WebFileServer: phone on the same WiFi -> http://%s:%d" % [ip, port])
 			break
+
+
+## The URL a phone on this WiFi should open to get the game AND the
+## automatic connection in one step. Empty when the build isn't being
+## served (no export on disk) or no LAN address could be found.
+func get_lan_url() -> String:
+	if _lan_ip.is_empty() or not _server.is_listening():
+		return ""
+	return "http://%s:%d" % [_lan_ip, port]
+
+
+## True for an address another device on the LAN could actually open - a
+## private/Internet-routable IPv4, not loopback or link-local.
+static func _usable_lan_ip(ip: String) -> bool:
+	if ip.contains(":"):
+		return false  # IPv6 literals need brackets in a URL; not worth it
+	var parts := ip.split(".")
+	if parts.size() != 4:
+		return false
+	if ip.begins_with("127.") or ip.begins_with("169.254."):
+		return false
+	for p in parts:
+		if not p.is_valid_int():
+			return false
+	return true
 
 
 func _process(_delta: float) -> void:

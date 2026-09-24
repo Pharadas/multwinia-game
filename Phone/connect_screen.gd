@@ -3,8 +3,15 @@ class_name ConnectScreen
 
 ## Full-screen manual-connect overlay for web phones. Shown whenever the
 ## socket is disconnected (and once at startup until the first connection);
-## hidden the moment the WebSocket opens. Typing an IP (or host:port, or a
-## full ws:// URL) calls the socket's set_remote_target() to dial it.
+## hidden the moment the WebSocket opens.
+##
+## It only appears when AUTOMATIC connection failed - a page served by the
+## game itself (http://<game-pc>:9095) connects with no input at all, and
+## the socket also sweeps the local network for a running game. So this
+## screen is the last resort, and on the web it has NO text box: the
+## engine's LineEdit can't reliably take keyboard focus inside a browser
+## canvas, and touch devices have no keyboard to open for it - the address
+## is typed into the browser's own prompt() dialog instead.
 
 signal connect_requested(target: String)
 
@@ -51,32 +58,34 @@ func _build_ui() -> void:
 	box.add_child(title)
 
 	var hint := Label.new()
-	hint.text = "Enter the host's IP (e.g. 203.0.113.7), IP:port,\nor a full ws:// or wss:// address.\nPages hosted on HTTPS (itch.io, github.io)\nmust use a wss:// address."
+	if OS.has_feature("web"):
+		hint.text = "No game found yet.\nClick the button and type the host's address\nin the browser's own prompt box - IP:port, or a\nwss:// address for a page hosted on itch.io."
+	else:
+		hint.text = "Enter the host's IP (e.g. 203.0.113.7), IP:port,\nor a full ws:// or wss:// address."
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_color_override("font_color", Color(1, 1, 1, 0.55))
 	box.add_child(hint)
 
-	_input = LineEdit.new()
-	_input.placeholder_text = "IP / IP:port / ws://..."
-	_input.add_theme_font_size_override("font_size", 24)
-	_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_input.text_submitted.connect(_on_text_submitted)
-	box.add_child(_input)
+	# NO text box on the web: a browser canvas LineEdit frequently never
+	# receives keystrokes, and a touch device has no keyboard to open for it.
+	# The browser's own prompt() dialog is the input method there (see
+	# _try_connect), so showing a box that silently eats typing would only
+	# confuse. Desktop/native runs keep the normal field.
+	if not OS.has_feature("web"):
+		_input = LineEdit.new()
+		_input.placeholder_text = "IP / IP:port / ws://..."
+		_input.add_theme_font_size_override("font_size", 24)
+		_input.alignment = HORIZONTAL_ALIGNMENT_CENTER
+		_input.text_submitted.connect(_on_text_submitted)
+		box.add_child(_input)
 
 	_connect_btn = Button.new()
 	_connect_btn.text = "Connect"
 	_connect_btn.add_theme_font_size_override("font_size", 24)
 	_connect_btn.pressed.connect(_try_connect)
 	box.add_child(_connect_btn)
-
-	# Web only: a canvas page can swallow keyboard input (the LineEdit above
-	# may never receive keystrokes depending on the browser's focus state),
-	# and mobile browsers have no hardware keyboard at all - so the primary
-	# way to enter an address on the web is the browser's own prompt dialog,
-	# which always works. The button doubles as the visible affordance for it.
 	if OS.has_feature("web"):
 		_connect_btn.text = "Enter address && connect"
-	
 	_fullscreen_btn = Button.new()
 	_fullscreen_btn.text = "Toggle fullscreen"
 	_fullscreen_btn.add_theme_font_size_override("font_size", 20)
@@ -140,15 +149,19 @@ func set_status(msg: String) -> void:
 	_status.text = msg
 
 func _try_connect() -> void:
-	var target := _input.text.strip_edges()
-	# Web: the LineEdit may never have received the keystrokes (browser
-	# canvas focus), so fall back to the browser's own prompt dialog.
+	var target := ""
+	if _input != null:
+		target = _input.text.strip_edges()
+	# Web: the browser's own prompt dialog IS the input (there is no text box
+	# - see _build_ui). It must be opened from a real user gesture, which a
+	# button press is.
 	if OS.has_feature("web"):
 		var typed = JavaScriptBridge.eval(
 				"window.prompt('Host address (IP:port or wss://...)','')", true)
-		if typed != null and not str(typed).is_empty():
+		if typed != null and not str(typed).strip_edges().is_empty():
 			target = str(typed).strip_edges()
-			_input.text = target
+			if _input != null:
+				_input.text = target
 	if target.is_empty():
 		set_status("type an address first")
 		return

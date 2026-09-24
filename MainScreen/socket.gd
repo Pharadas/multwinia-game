@@ -188,14 +188,63 @@ func _setup_upnp() -> void:
 ## fallback even with discovery enabled, without digging through OS network
 ## settings.
 func _print_local_addresses() -> void:
-	for addr in IP.get_local_addresses():
-		# Skip loopback and link-local addresses - not useful for another
-		# device on the LAN to connect to.
-		if addr.begins_with("127.") or addr.begins_with("169.254.") or addr == "::1":
-			continue
+	for addr in get_lan_addresses():
 		print("HexTerrainSocket: reachable at %s:%d" % [addr, port])
 	# The public (UPnP) address is printed by _setup_upnp() on its worker
 	# thread once discovery finishes - no need to block startup for it.
+
+
+## The LAN addresses another device can actually reach this server on,
+## best-first: private ranges (the ones a phone on the same WiFi uses)
+## before anything else, loopback / link-local / IPv6 dropped entirely -
+## they are meaningless to another device and unreachable through the HUD.
+## Read-only: nothing here touches the network, so the lobby can call it
+## every second.
+func get_lan_addresses() -> Array:
+	var public_like: Array = []
+	var private_first: Array = []
+	for addr in IP.get_local_addresses():
+		# Skip loopback, link-local and IPv6 - not useful for another
+		# device on the LAN to connect to.
+		if addr.begins_with("127.") or addr.begins_with("169.254.") \
+				or addr == "::1" or addr.contains(":"):
+			continue
+		if is_private_ipv4(addr):
+			private_first.append(addr)
+		else:
+			public_like.append(addr)
+	return private_first + public_like
+
+
+## The router's public (external) IP as reported by UPnP - empty until the
+## background discovery finishes, and empty forever on a router without
+## UPnP. Shown in the lobby so the host can tell players outside the LAN
+## what to dial.
+func get_public_ip() -> String:
+	return _upnp_external_ip
+
+
+## True for the IPv4 ranges a home/office LAN uses (RFC 1918 + CGNAT).
+## Static and literal-only: a hostname is not an address and returns false.
+static func is_private_ipv4(addr: String) -> bool:
+	var parts := addr.split(".")
+	if parts.size() != 4:
+		return false
+	for p in parts:
+		if not p.is_valid_int():
+			return false
+		var v := int(p)
+		if v < 0 or v > 255:
+			return false
+	var a := int(parts[0])
+	if a == 10:
+		return true
+	if a == 192 and int(parts[1]) == 168:
+		return true
+	if a == 172 and int(parts[1]) >= 16 and int(parts[1]) <= 31:
+		return true
+	# 100.64.0.0/10 (CGNAT) - some ISPs hand these out on the LAN side.
+	return a == 100 and int(parts[1]) >= 64 and int(parts[1]) <= 127
 
 
 func _process(_delta: float) -> void:
@@ -413,9 +462,9 @@ func _tilemap_points_to_world(points: Array, ref_cells: Array, ref_locals: Array
 		return []
 
 	if ref_cells.size() >= 3 and ref_locals.size() >= 3 and terrain and terrain.has_method("get_hex_center"):
-		var c0: Vector2i = ref_cells[0]
-		var c1: Vector2i = ref_cells[1]
-		var c2: Vector2i = ref_cells[2]
+		var c0: Vector2i = _as_vec2(ref_cells[0])
+		var c1: Vector2i = _as_vec2(ref_cells[1])
+		var c2: Vector2i = _as_vec2(ref_cells[2])
 
 		var l0: Vector2 = _as_vec2(ref_locals[0])
 		var l1: Vector2 = _as_vec2(ref_locals[1])

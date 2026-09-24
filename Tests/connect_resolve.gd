@@ -29,6 +29,8 @@ func _initialize() -> void:
 	_test_resolution(phone)
 	print("=== _assign_team (both transports) ===")
 	_test_team_assignment(server)
+	print("=== LAN sweep candidates ===")
+	_test_sweep_candidates()
 	print("=== discovery reply parsing ===")
 	_test_discovery_reply()
 	print("=== facade learns its team ===")
@@ -45,6 +47,36 @@ func _initialize() -> void:
 	else:
 		print("FAILED - %d of %d checks failed" % [_failures, _checks])
 		quit(1)
+
+
+# --- 1c. browser LAN sweep candidates ----------------------------------------
+
+## The web phone can't broadcast UDP, so it scans the page host's own /24 for
+## a game. That scan must stay inside the LAN: a public page host (itch.io, a
+## CDN, a bare IP on the internet) has no subnet worth probing, and on an
+## HTTPS page every ws:// is blocked before it leaves the browser anyway.
+func _test_sweep_candidates() -> void:
+	var lan: Array = HexGrid2DSocket.sweep_candidates("192.168.1.82")
+	_check("lan /24 size", str(lan.size()), "253")
+	_check("skips the page host itself", str(lan.has("192.168.1.82")), "false")
+	_check("includes the first host", str(lan.has("192.168.1.1")), "true")
+	_check("includes the last host", str(lan.has("192.168.1.254")), "true")
+	_check("nothing outside the subnet",
+		str(lan.all(func(a): return str(a).begins_with("192.168.1."))), "true")
+	_check("10.x /24 size", str(HexGrid2DSocket.sweep_candidates("10.0.0.5").size()), "253")
+	_check("172.16.x is private", str(HexGrid2DSocket.sweep_candidates("172.16.5.5").size()), "253")
+	_check("172.32.x is not private", str(HexGrid2DSocket.sweep_candidates("172.32.5.5").size()), "0")
+	# A dead address the socket is already retrying must not be probed twice.
+	var skipped: Array = HexGrid2DSocket.sweep_candidates("192.168.1.82",
+			["192.168.1.82", "192.168.1.10"])
+	_check("skip list honoured",
+		"%d/%s" % [skipped.size(), str(skipped.has("192.168.1.10"))], "252/false")
+	# Nothing to sweep: a public IPv4, a hostname, an IPv6 literal, empty.
+	_check("public IPv4", str(HexGrid2DSocket.sweep_candidates("8.8.8.8").size()), "0")
+	_check("hostname", str(HexGrid2DSocket.sweep_candidates("pharadas.itch.io").size()), "0")
+	_check("IPv6 literal", str(HexGrid2DSocket.sweep_candidates("fe80::1").size()), "0")
+	_check("empty host", str(HexGrid2DSocket.sweep_candidates("").size()), "0")
+	_check("over-long octet", str(HexGrid2DSocket.sweep_candidates("192.168.1.999").size()), "0")
 
 
 # --- 1b. discovery reply parsing --------------------------------------------

@@ -182,8 +182,25 @@ func _connect_socket() -> void:
 		# Initial state: a web page always starts disconnected, so show it.
 		_on_connection_state_changed(
 				socket.is_web_connected() if socket.has_method("is_web_connected") else false)
+	if socket and socket.has_signal("lan_sweep_state_changed"):
+		socket.lan_sweep_state_changed.connect(_on_lan_sweep_state_changed)
 	if socket and connect_screen and not connect_screen.connect_requested.is_connected(_on_connect_requested):
 		connect_screen.connect_requested.connect(_on_connect_requested)
+
+## The socket scans the local network by itself when the automatic target
+## doesn't answer. Say so on the connect screen - "searching" is much more
+## reassuring than an address that keeps failing, and it tells the player to
+## hold off on typing anything.
+func _on_lan_sweep_state_changed(searching: bool) -> void:
+	if connect_screen == null or not OS.has_feature("web"):
+		return
+	if searching:
+		connect_screen.set_status("searching your WiFi for a game...")
+	else:
+		# Back to whatever the connection state has to say.
+		var socket := _get_socket_node()
+		_on_connection_state_changed(
+			socket.is_web_connected() if socket and socket.has_method("is_web_connected") else false)
 
 ## Typed address from the connect screen -> socket override + reconnect.
 func _on_connect_requested(target: String) -> void:
