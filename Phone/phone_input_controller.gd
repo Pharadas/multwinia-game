@@ -350,6 +350,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			_holding_start_hex = current_cell() == _press_start_cell
 		return
 
+	if event is InputEventMouseMotion and not _touch_active:
+		# Extend an in-progress mouse stroke straight from the motion event.
+		# _process also polls the button for platforms that do not deliver
+		# motion while dragging; the spacing check makes doing both cheap.
+		if _mode == Mode.STROKING and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+			_extend_stroke(_to_local(event.position))
+		return
+
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		if _touch_active:
 			return  # real touch already handled this press
@@ -370,19 +378,24 @@ func _unhandled_input(event: InputEvent) -> void:
 				return
 			if _mode != Mode.CARRYING:
 				_begin_stroke(_to_local(get_viewport().get_mouse_position()))
-	else:
-		_press_start_cell = Vector2i(-1, -1)
-		if _menu_open:
-			_end_menu()
-			return
-		if _menu_pending:
-			# Quick double-tap: not a menu - a normal tap (see touch branch).
-			_menu_pending = false
-		if _mode == Mode.CARRYING:
-			building_dropped.emit(current_cell(), _carry_building_id)
-			cancel_carry()
 		else:
-			_end_stroke()
+			# Release. NOTE: this used to sit in an `else` of the whole
+			# mouse-button check, so EVERY other event (mouse motion, keys)
+			# ran it - hovering fired taps and the first motion ended each
+			# stroke, which killed path drawing and made lobby spawn picks
+			# follow the pointer. Motion is polled in _process instead.
+			_press_start_cell = Vector2i(-1, -1)
+			if _menu_open:
+				_end_menu()
+				return
+			if _menu_pending:
+				# Quick double-tap: not a menu - a normal tap (see touch branch).
+				_menu_pending = false
+			if _mode == Mode.CARRYING:
+				building_dropped.emit(current_cell(), _carry_building_id)
+				cancel_carry()
+			else:
+				_end_stroke()
 
 
 ## Mouse strokes: mouse motion is not a drag event, so poll the button.

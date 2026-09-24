@@ -109,16 +109,16 @@ var _path_followers_cells: int = 0
 ## the army size is an explicit choice, not instance_count / 4.
 var _dots_per_team: int = 0
 
-## Number of teams this run. Generalized: any N >= 1. grid_dims.y equals
-## this value (the per-team 2D grid slices), and it is pushed to every
-## shader as grid_dims.w so GPU-side team indexing matches the buffer
-## layouts (hex paths, followers, econ stats) exactly.
-##
-## One slot is always RESERVED as the NPC horde (team id num_teams - 1):
-## deserters. No phone is ever assigned it, no boid spawns in it, but
-## starving boids randomly defect into it and it fights everyone. Player
-## teams are 0..num_teams - 2.
-var num_teams: int = 5
+## Number of team slices the sim runs with. FIXED at MAX_PLAYER_TEAMS + 1
+## (the +1 is the reserved NPC horde, team id num_teams - 1): every team-
+## indexed buffer (spatial grid, hex paths, econ stats) is sized ONCE for
+## that many slices at startup, so teams never have to be configured. A
+## player team only becomes real when a phone joins (activate_team seeds
+## its army and grants its pool) - any number of phones up to
+## MAX_PLAYER_TEAMS can play with zero configuration. Deserters convert
+## into the horde; no phone is ever assigned it.
+const MAX_PLAYER_TEAMS := 16
+var num_teams: int = MAX_PLAYER_TEAMS + 1
 
 ## How fast broke teams bleed units to the horde. Each in-debt boid converts
 ## with per-frame chance min(deficit * DESERTION_RATE, 0.0005) (plus a slow
@@ -204,7 +204,8 @@ const STARTING_RESOURCES_PER_DOT := 50.0
 ## CPU-side resource pool per team.
 var _team_resources: Array[float] = []
 ## Next unused boid slot per team for barrack production. The live army
-## occupies 0 .. _dots_per_team * player_teams - 1 (round-robin by team),
+## occupies whatever slots activate_team() claimed for it (its own range,
+## independent of every other team's)
 ## so each team's production starts at its own first free slot; the base
 ## is computed in _create_buffers once the army size is known.
 var _next_free_slot: Array[int] = []
@@ -223,6 +224,7 @@ var _miner_ids: PackedInt32Array = PackedInt32Array()
 var _miner_respawn_timer := 0.0
 ## Set by main_screen.gd (or a demo harness) to learn when a mine's ground
 ## tile is destroyed, so meshes/terrain can react.
+signal team_activated(team: int)
 signal mine_collapsed(cell: Vector2i, world_pos: Vector2)
 ## Emitted when a mine's owner changes (captured from neutral or stolen
 ## from another team) so UIs can recolor it. team = new owner, always a
@@ -262,20 +264,15 @@ func _ready() -> void:
 			anc = anc.get_parent()
 	if ms != null and "dots_per_team" in ms:
 		set_dot_count_per_team(int(ms.dots_per_team))
-	# num_teams is NOT read from the socket: it is the SOURCE OF TRUTH for
-	# the whole run (buffer layouts, team coloring, seeding all key off it
-	# and it is frozen once _create_buffers runs). The socket follows the
-	# sim instead - main_screen.gd hands phones team ids 0..num_teams-2 -
-	# so editing num_teams here is all it takes to change the team count.
+	# num_teams is FIXED at MAX_PLAYER_TEAMS + 1 and is not configurable:
+	# all team-indexed buffers are sized for the maximum up front, and a
+	# team only becomes real when a phone joins (activate_team). The socket
+	# derives its own max_teams from this, so join-driven teams need no
+	# editing here or anywhere else.
 
-	# Upper bound: we never need more slots than the multimesh can hold.
-	# Both teams get the same count, so the total must fit in the pool.
-	var wanted := _dots_per_team * (num_teams - 1)
-	if wanted > instance_count:
-		wanted = instance_count
-	if wanted <= 0:
-		wanted = instance_count
-	_dots_per_team = wanted / (num_teams - 1)
+	# Armies are seeded when a phone JOINS (activate_team), not at startup,
+	# so the per-team count only has to fit inside the buffer by itself.
+	_dots_per_team = clampi(_dots_per_team, 0, maxi(instance_count - MINER_COUNT, 0))
 
 	multimesh.instance_count = 0
 	multimesh.instance_count = instance_count
@@ -474,18 +471,12 @@ func _create_buffers() -> void:
 	zero_bytes.resize(16)  # zero-filled 4-float header
 	heightmap_rid = rd.storage_buffer_create(16, zero_bytes)
 
-	# Player teams start with a pool that scales with their army size; the
-	# reserved NPC horde slot starts broke and stays broke: no mines pay it
-	# (it never owns mines), no income, no revivals.
-	var starting_pool := STARTING_RESOURCES + float(_dots_per_team) * STARTING_RESOURCES_PER_DOT
+	# Every team starts broke: the starting pool is granted when a phone
+	# joins and its army is actually seeded (see activate_team). The NPC
+	# horde slot stays broke forever, as before.
 	for t in range(num_teams):
-		_team_resources.append(0.0 if t == num_teams - 1 else starting_pool)
+		_team_resources.append(0.0)
 		_next_free_slot.append(0)
-	# Boid id t + k*player_teams belongs to team t (round-robin spawn), so
-	# team t's production starts after the last round dealt to ANY team.
-	var army_end := _dots_per_team * (num_teams - 1)
-	for t in range(num_teams):
-		_next_free_slot[t] = army_end
 
 	# Reserve the last MINER_COUNT boid slots for the special center miners.
 	# They stay dead/unrendered until setup_special_mine() activates them,
@@ -521,68 +512,12 @@ func _create_buffers() -> void:
 ##   +40 assigned_path_slot (u32)         +44 team (u32)
 ##   +48 health (u32)     +52 home_hex (s32)          +56/+60 padding
 ##
-## Reserve slots (id >= army size) stay zeroed: health 0 reads as dead, so
-## the GPU never renders them. Production and the special miners fill those
-## in later (see _economy_tick, setup_special_mine).
+## EVERY slot starts dead (zero-filled = health 0): armies are seeded when
+## phones join (activate_team), not here, so an empty lobby has no dots at
+## all and a 17th phone can never silently overwrite an existing army.
 func _build_state_bytes() -> PackedByteArray:
-	const ROW := 64
 	var bytes := PackedByteArray()
-	bytes.resize(instance_count * ROW)  # zero-filled
-
-	# Only the live army is seeded, and only the PLAYER teams (0..num_teams-2):
-	# the last slot is the reserved NPC horde, which starts empty and fills up
-	# purely through desertion. Ids are assigned round-robin, so team t owns
-	# every player_teams-th slot - the same mapping the rest of the sim uses.
-	var player_teams := maxi(num_teams - 1, 1)
-	var army := mini(_dots_per_team * player_teams, instance_count)
-	if army <= 0:
-		return bytes
-
-	_compute_team_bases()
-	# Per-tile spawn anchors, computed ONCE. The old loop called
-	# get_hex_center() - which samples the terrain height - and world_to_hex()
-	# for every single dot, tens of interpreter operations each, millions of
-	# times for a large army, all to reproduce the same handful of tile
-	# centers. The anchors are the hexes themselves, so the dot's hex id is
-	# known without a world-to-hex round trip.
-	var anchors_by_team: Array = []
-	for team in range(player_teams):
-		var rect: Array = team_bases[mini(team, team_bases.size() - 1)]
-		var anchors: Array = []
-		for c in range(rect[0], rect[2] + 1):
-			for r in range(rect[1], rect[3] + 1):
-				if c == rect[0] and r == rect[1]:
-					continue  # the generator tile, owned by main_screen
-				anchors.append({"pos": get_hex_center(c, r), "hex": hex_to_id(c, r)})
-		if anchors.is_empty():
-			anchors.append({"pos": get_hex_center(rect[0], rect[1]),
-					"hex": hex_to_id(rect[0], rect[1])})
-		anchors_by_team.append(anchors)
-
-	# bi = id / player_teams walks each team's slots in order without the old
-	# per-team id lists (which were an O(army x teams) scan of the army).
-	var jitter := mesh_scale * 0.3
-	for id in range(army):
-		var team := id % player_teams
-		var anchors: Array = anchors_by_team[team]
-		var anchor: Dictionary = anchors[(id / player_teams) % anchors.size()]
-		var center: Vector3 = anchor.pos
-		var hex_id: int = anchor.hex
-		var pos := center + Vector3(
-			randf_range(-jitter, jitter),
-			randf_range(0.0, 4.0),
-			randf_range(-jitter, jitter)
-		)
-		var off := id * ROW
-		bytes.encode_float(off, pos.x)
-		bytes.encode_float(off + 4, pos.y)
-		bytes.encode_float(off + 8, pos.z)
-		bytes.encode_u32(off + 12, hex_id)      # pos.w = hex this dot stands in
-		# state (32) and path_slot (40) are already zero from the resize.
-		bytes.encode_u32(off + 36, NO_PATH)      # no assigned path
-		bytes.encode_u32(off + 44, team)
-		bytes.encode_u32(off + 48, 1000)         # health
-		bytes.encode_s32(off + 52, hex_id)       # home_hex = spawn hex
+	bytes.resize(instance_count * 64)  # zero-filled: all slots dead
 	return bytes
 
 
@@ -593,6 +528,100 @@ func _build_state_bytes() -> PackedByteArray:
 ## keeps the corner base its army was seeded into.
 var team_spawn_hexes: Dictionary = {}
 const MAX_SPAWN_HEXES := 3
+
+
+## Brings team `team` to life the moment a phone is handed it: grants the
+## starting pool and seeds that team's army into its corner base (or its
+## lobby-picked hexes, if the picks arrived first - they're re-applied at
+## start_game() anyway). Idempotent: a phone reconnecting onto the same
+## team id does NOT re-seed or re-fund it. The army size is the configured
+## dots-per-team, taken from the SHARED free-slot pool past the seeded
+## army - no round-robin id layout anymore, teams are independent ranges.
+## Returns false when the team id is out of range or the slot budget is
+## exhausted (every multimesh slot already claimed).
+func activate_team(team: int) -> bool:
+	if team < 0 or team >= num_teams - 1:
+		return false
+	if _active_teams.has(team):
+		return true  # already funded + seeded
+	if rd == null:
+		return false  # buffers not built yet; seeding is impossible
+	var budget := _dots_per_team
+	var cap := _army_slot_cap if _army_slot_cap > 0 else instance_count
+	var taken := 0
+	for other in _active_teams.values():
+		taken += int(other.get("dots", 0))
+	if taken + budget > cap:
+		budget = maxi(cap - taken, 0)
+	if budget <= 0:
+		push_warning("Sim: no boid slots left for a new team (cap %d, taken %d)." % [cap, taken])
+		return false
+
+	# Grant the pool first so upkeep never sees a funded army without money.
+	_team_resources[team] = STARTING_RESOURCES + float(budget) * STARTING_RESOURCES_PER_DOT
+
+	# Seed the army into the team's corner base (the same anchors the old
+	# startup seeding used). Slots come from the shared cursor so two teams
+	# can never overlap.
+	_compute_team_bases()
+	var rect: Array = team_bases[mini(team, team_bases.size() - 1)]
+	var anchors: Array = []
+	for c in range(rect[0], rect[2] + 1):
+		for r in range(rect[1], rect[3] + 1):
+			if c == rect[0] and r == rect[1]:
+				continue  # the generator tile, owned by main_screen
+			anchors.append({"pos": get_hex_center(c, r), "hex": hex_to_id(c, r)})
+	if anchors.is_empty():
+		anchors.append({"pos": get_hex_center(rect[0], rect[1]),
+				"hex": hex_to_id(rect[0], rect[1])})
+
+	var ids: Array = []
+	for i in range(budget):
+		var slot := _take_free_slot()
+		ids.append(slot)
+		var anchor: Dictionary = anchors[i % anchors.size()]
+		var center: Vector3 = anchor.pos
+		var jitter := mesh_scale * 0.3
+		var pos := center + Vector3(
+			randf_range(-jitter, jitter), randf_range(0.0, 4.0), randf_range(-jitter, jitter))
+		_write_boid_row(slot, _boid_row(pos, team, 1000, int(anchor.hex)))
+
+	_active_teams[team] = {"dots": budget, "ids": ids}
+	_team_ids[team] = ids
+	print("Sim: team %d activated with %d dots (active teams: %s)." %
+			[team, budget, str(_active_teams.keys())])
+	team_activated.emit(team)
+	resources_changed.emit(_team_resources.duplicate())
+	return true
+
+
+## Is this player team live (a phone holds it)? The economy tick and the
+## lobby both filter through this, so inactive teams cost nothing.
+func is_team_active(team: int) -> bool:
+	return _active_teams.has(team)
+
+
+## The sim's pool for team `team` (0.0 for never-activated teams).
+func get_team_resource(team: int) -> float:
+	return float(_team_resources[team]) if team >= 0 and team < _team_resources.size() else 0.0
+
+
+## Deactivates a team whose phone left: its dots die (health 0 - the GPU
+## culls them) and its pool is zeroed, so a late joiner gets a fresh start.
+func deactivate_team(team: int) -> void:
+	if not _active_teams.has(team):
+		return
+	for id in _team_ids.get(team, []):
+		var data := PackedByteArray()
+		data.resize(64)  # health 0 = dead, everything else default
+		_write_boid_row(int(id), data)
+	_team_resources[team] = 0.0
+	_team_ids.erase(team)
+	_active_teams.erase(team)
+	# A new phone taking this team id must not inherit the previous
+	# player's spawn picks - they chose where THEIR army starts.
+	team_spawn_hexes.erase(team)
+	resources_changed.emit(_team_resources.duplicate())
 
 
 ## Divides `count` dots among `k` groups as evenly as possible: the first
@@ -636,7 +665,7 @@ static func spawn_positions_in_hex(center: Vector3, radius: float, count: int) -
 ## MAX_SPAWN_HEXES DISTINCT hexes that actually exist on this map, then moves
 ## that team's already-seeded army into them, divided as evenly as possible.
 func set_team_spawn_hexes(team: int, world_positions: Array) -> void:
-	if rd == null or team < 0 or team >= num_teams:
+	if team < 0 or team >= num_teams:
 		return
 	var cells: Array = []
 	for entry in world_positions:
@@ -666,7 +695,12 @@ func set_team_spawn_hexes(team: int, world_positions: Array) -> void:
 		team_spawn_hexes.erase(team)
 	else:
 		team_spawn_hexes[team] = cells
-	_relocate_team_army(team)
+	# Relocation needs live buffers (rd) AND a seeded army (_team_ids); both
+	# are missing when a phone joins during terrain generation. The picks are
+	# STILL STORED - start_game() re-applies them, so an early pick made
+	# before the sim was ready used to be silently discarded here.
+	if rd != null:
+		_relocate_team_army(team)
 
 
 ## The hexes a team's starting army stands in, as sim hex cells. Empty means
@@ -686,15 +720,11 @@ func _relocate_team_army(team: int) -> void:
 	var hexes: Array = team_spawn_hexes.get(team, [])
 	if hexes.is_empty():
 		return
-	var player_teams := maxi(num_teams - 1, 1)
-	var army := mini(_dots_per_team * player_teams, instance_count)
-	# Ids are dealt round-robin (id % player_teams == team), so a team's slots
-	# are every player_teams-th id - no per-team id lists needed.
-	var ids: Array = []
-	var id := team
-	while id < army:
-		ids.append(id)
-		id += player_teams
+	# Teams own their slots outright since the join-driven rework: whatever
+	# activate_team() claimed for this team is exactly what moves.
+	var ids: Array = _team_ids.get(team, [])
+	if ids.is_empty():
+		return
 	var counts := split_spawn_counts(ids.size(), hexes.size())
 	# Dots are placed inside 75% of the hex's circumradius so none of them
 	# start past the wall of their own hex.
@@ -1388,6 +1418,13 @@ var _building_sites: Dictionary = {}
 ## Vector2i(cell_x, cell_z) -> {"team": int, "world": Vector2}
 var _active_mines: Dictionary = {}
 
+## Live player teams: team id -> {"dots": int, "ids": Array}. Filled by
+## activate_team() as phones join; a team not in here has no army, no pool
+## and costs nothing. The NPC horde (num_teams - 1) is never in here.
+var _active_teams: Dictionary = {}
+## Per-team boid slot lists for the active teams (deactivation kills them).
+var _team_ids: Dictionary = {}
+
 ## Runs once per simulated second: mines pay out, upkeep drains, starve
 ## flags update, and each barrack revives one dead dot if the team can pay.
 func _economy_tick() -> void:
@@ -1447,13 +1484,13 @@ func _economy_tick() -> void:
 			mines_to_collapse.append(cell)
 
 	# --- upkeep: every LIVING dot costs 1 resource / 5 seconds ---
+	# Only ACTIVE teams pay upkeep; a team slice with no phone costs nothing
+	# (its econ_stats counter is irrelevant since nothing is seeded there).
 	var stats := rd.buffer_get_data(econ_stats_rid, 0, 2 * num_teams * 4)
 	if stats.size() >= 2 * num_teams * 4:
-		for t in range(num_teams):
-			# The reserved NPC horde pays nothing: deserters live off the land,
-			# so their pool never goes into debt and never starves.
-			upkeep[t] = 0.0 if t == num_teams - 1 \
-				else float(stats.decode_u32(t * 2 * 4)) * UPKEEP_PER_SEC
+		for t in _active_teams.keys():
+			var team := int(t)
+			upkeep[team] = float(stats.decode_u32(team * 2 * 4)) * UPKEEP_PER_SEC
 
 	# SPECIAL MINE: pay the per-living-miner bonus to its owner. Added to
 	# income[] BEFORE the apply loop so the same tick's pool update and
@@ -1477,6 +1514,11 @@ func _economy_tick() -> void:
 	var flags := PackedByteArray()
 	flags.resize(num_teams * 3 * 4)
 	for t in range(num_teams):
+		# Inactive teams (no phone) stay at 0 and never starve - nothing is
+		# seeded in their slice anyway. The NPC horde (never in _active_teams)
+		# keeps its always-zero pool: deserters live off the land.
+		if not _active_teams.has(t):
+			continue
 		_team_resources[t] += income[t] - upkeep[t]
 		# The pool is NOT floored at zero: the balance IS the running debt,
 		# which is the whole point of the mechanic - sim.glsl scales the
@@ -1506,27 +1548,33 @@ func _economy_tick() -> void:
 	# multiplied per team and then all dots appeared at one arbitrary
 	# barrack, so a second barrack charged full price and produced nothing.
 	var sites_by_team := _barrack_sites_by_team()
-	for t in range(num_teams):
-		var sites: Array = sites_by_team[t]
+	for t in _active_teams.keys():
+		var team := int(t)
+		var sites: Array = sites_by_team[team]
 		if sites.is_empty():
 			continue  # no barrack: nothing can spawn or revive for this team
-		var dead_id := stats.decode_u32((t * 2 + 1) * 4) if stats.size() >= 2 * num_teams * 4 else 0
-		if dead_id != 0 and _team_resources[t] >= BARRACK_REVIVE_COST:
-			_team_resources[t] -= BARRACK_REVIVE_COST
-			_revive_boid(t, dead_id - 1, _nearest_site(sites, _boid_last_position(dead_id - 1)))
+		var dead_id := stats.decode_u32((team * 2 + 1) * 4) if stats.size() >= 2 * num_teams * 4 else 0
+		if dead_id != 0 and _team_resources[team] >= BARRACK_REVIVE_COST:
+			_team_resources[team] -= BARRACK_REVIVE_COST
+			_revive_boid(team, dead_id - 1, _nearest_site(sites, _boid_last_position(dead_id - 1)))
 		# --- new-dot production, per barrack ---
 		for site_world in sites:
 			var prod: int = BARRACK_PROD_RATE
-			while prod > 0 and _team_resources[t] >= BARRACK_REVIVE_COST \
+			while prod > 0 and _team_resources[team] >= BARRACK_REVIVE_COST \
 					and _slot_cursor() < _army_slot_cap:
-				_team_resources[t] -= BARRACK_REVIVE_COST
+				_team_resources[team] -= BARRACK_REVIVE_COST
 				# Production slots (>= army size) were never alive, so no
 				# overlap with the revive pool can happen.
-				_revive_boid(t, _take_free_slot(), site_world)
+				var prod_slot := _take_free_slot()
+				_revive_boid(team, prod_slot, site_world)
+				# Bookkeeping: produced dots must join the team's id list, or
+				# deactivate_team() leaves them alive on the map as an
+				# orphaned army (its pool is gone but the dots persist).
+				if _team_ids.has(team):
+					_team_ids[team].append(prod_slot)
 				prod -= 1
 
 	rd.buffer_update(econ_res_rid, 0, flags.size(), flags)
-
 	resources_changed.emit(_team_resources.duplicate())
 
 ## Whether the placing team can afford this building. Walls have a real
@@ -1571,10 +1619,8 @@ func set_dot_count_per_team(n: int) -> void:
 		return
 	if n < 0:
 		n = 0
-	# Keep the total army inside the multimesh capacity for ANY team count
-	# (player teams only - the NPC horde fills by desertion, not spawning).
-	if instance_count > 0 and n * maxi(num_teams - 1, 1) > instance_count:
-		n = instance_count / maxi(num_teams - 1, 1)
+	# Armies are seeded per joining team now (activate_team), so the count
+	# only has to fit the multimesh budget by itself, not times team count.
 	_dots_per_team = n
 
 ## The next unclaimed production slot. Slots come from ONE shared pool -

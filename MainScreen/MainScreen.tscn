@@ -6,7 +6,6 @@
 [ext_resource type="Script" uid="uid://bgu6cm1apaj4i" path="res://Demos/stupid simple/explosion_pool.gd" id="4_expl"]
 
 [sub_resource type="Gradient" id="Gradient_esa1g"]
-offsets = PackedFloat32Array(0, 0.04945055)
 
 [sub_resource type="FastNoiseLite" id="FastNoiseLite_hdewi"]
 seed = -492181015

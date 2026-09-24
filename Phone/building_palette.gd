@@ -31,6 +31,7 @@ func _ready() -> void:
 	_build_lobby_panel()
 	_build_resource_label()
 	_build_palette()
+	_build_fullscreen_button()
 
 
 ## Shows/hides the lobby spawn picker banner and updates its counter. Called
@@ -203,3 +204,29 @@ func _build_palette() -> void:
 		chip.mouse_default_cursor_shape = Control.CURSOR_DRAG
 		row.add_child(chip)
 	add_child(palette)
+
+
+## Web only: a tiny always-available fullscreen toggle (top-right). The
+## browser's requestFullscreen must come from a user gesture, so a button
+## is the only dependable way in; hidden on native where F11/window mode
+## already exists.
+func _build_fullscreen_button() -> void:
+	if not OS.has_feature("web"):
+		return
+	var btn := Button.new()
+	btn.name = "FullscreenButton"
+	btn.text = "Full screen"   # ASCII: the default web font lacks the fullscreen glyph
+	btn.custom_minimum_size = Vector2(96, 40)
+	btn.add_theme_font_size_override("font_size", 14)
+	btn.anchor_left = 1.0
+	btn.anchor_right = 1.0
+	btn.offset_left = -108.0
+	btn.offset_top = 12.0
+	btn.offset_right = -12.0
+	btn.offset_bottom = 52.0
+	btn.pressed.connect(func() -> void:
+		if DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_FULLSCREEN:
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+		else:
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN))
+	add_child(btn)

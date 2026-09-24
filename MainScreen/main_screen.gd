@@ -125,9 +125,16 @@ func _ready() -> void:
 	# Required for CollisionObject3D.input_event to fire on mouse clicks.
 	get_viewport().physics_object_picking = true
 	_disable_legacy_collision()
+	# Serve the web build over the LAN: a phone on the same WiFi can open
+	# http://<this-pc-ip>:9095 and auto-connects (a page served by the game
+	# machine may dial ws:// to it - an itch.io page never can).
+	var web_server := preload("res://MainScreen/web_file_server.gd").new()
+	web_server.name = "WebFileServer"
+	add_child(web_server)
 	# Connected before generate_terrain() so the first crate drop isn't
 	# missed if terrain generation finishes synchronously.
 	terrain_ready.connect(_on_terrain_ready)
+	terrain_ready.connect(func() -> void: _flush_pending_team_activations.call_deferred())
 	generate_terrain()
 
 	var socket := get_node_or_null("Socket")
@@ -190,7 +197,11 @@ func _send_resources_to_phones(resources: Array) -> void:
 	if socket == null or not socket.has_method("broadcast_team_resources"):
 		return
 	# Broadcast every pool EXCEPT the sim's reserved NPC horde slot (last
-	# index) - deserters don't own resources and no phone is that team.
+	# index) - deserters don't own resources and no phone is that team. The
+	# array is sized for the sim's full MAX team count, but inactive teams
+	# hold 0 and there is a phone to receive it only for active ones - the
+	# phones filter by their own team id anyway, so sending all of it is
+	# harmless and stays correct when a team activates mid-match.
 	var player_pools: int = maxi(resources.size() - 1, 0)
 	for t in range(player_pools):
 		socket.broadcast_team_resources(t, float(resources[t]))
@@ -226,20 +237,58 @@ func _on_mine_collapsed(cell: Vector2i, world_pos: Vector2) -> void:
 
 # ---- lobby (who has joined + when the match begins) --------------------------
 
-## A phone just joined and was handed this team: show it in the lobby, in
-## that team's color, so the host can see who is waiting before starting.
+## A phone just joined and was handed this team: bring that team to life in
+## the sim (pool + army seeded now, not at startup - any number of phones
+## up to the sim's MAX_PLAYER_TEAMS can join with zero configuration), show
+## it in the lobby in its own color, and tell everyone the lobby state.
 func _on_player_joined(team: int) -> void:
 	_joined_teams[team] = true
+	var ss := _sim_node()
+	var activated := false
+	if ss and ss.has_method("activate_team"):
+		activated = ss.activate_team(team)
+	print("Lobby: team %d join -> sim activation %s (sim found: %s)." % [team, "ok" if activated else "DEFERRED", str(ss != null)])
+	if not activated:
+		# The sim's GPU buffers don't exist yet (a phone dialed in during
+		# terrain generation) - retry once the sim is up.
+		_pending_team_activations[team] = true
+	else:
+		_pending_team_activations.erase(team)
 	_refresh_lobby()
 	# A phone that just joined (or reconnected) needs to know it's in the
 	# lobby and whether it already picked its spawn hexes.
 	_broadcast_lobby_state()
 
 
+## Teams that joined before the sim could seed them (see _on_player_joined).
+var _pending_team_activations: Dictionary = {}
+
+
+## Flushes join-activations that had to wait for the sim's buffers. A team
+## whose phone already left must NOT be activated - its pending entry is
+## dropped (a stale entry here would seed an army nobody commands).
+func _flush_pending_team_activations() -> void:
+	if _pending_team_activations.is_empty():
+		return
+	var ss := _sim_node()
+	if ss == null or not ss.has_method("activate_team"):
+		return
+	for team in _pending_team_activations.keys():
+		var t := int(team)
+		if _joined_teams.get(t, false):
+			ss.activate_team(t)
+	_pending_team_activations.clear()
+
+
 ## That phone disconnected: drop its row - the lobby only ever lists players
-## who are actually connected right now.
+## who are actually connected right now - and release its team's army +
+## pool, so the team id frees up completely for the next phone.
 func _on_player_left(team: int) -> void:
 	_joined_teams.erase(team)
+	_pending_team_activations.erase(team)
+	var ss := _sim_node()
+	if ss and ss.has_method("deactivate_team"):
+		ss.deactivate_team(team)
 	_refresh_lobby()
 	_broadcast_lobby_state()
 

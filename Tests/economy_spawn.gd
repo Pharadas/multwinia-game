@@ -33,6 +33,7 @@ func _initialize() -> void:
 	_test_barrack_grouping(sim)
 	_test_nearest_site(sim)
 	_test_slot_allocation(sim)
+	_test_team_activation(sim)
 	_test_state_bytes(sim)
 	_test_boid_row_packing(sim)
 	_bench_state_bytes()
@@ -130,54 +131,42 @@ func _test_slot_allocation(sim: Node) -> void:
 	_check("stale team watermark ignored", str(sim._take_free_slot()), "26")
 
 
-## The initial BoidState buffer: sizes, field offsets and the base spawn.
-## Offsets have to match sim.glsl exactly - a wrong one silently gives every
-## dot garbage (the wrong team, or 0 health = invisible).
+## Join-driven team activation (pure-CPU parts): the slot ledger, idempotency
+## guard and deactivation bookkeeping - activate_team's GPU writes need rd,
+## so the buffer side is exercised by the live game instead.
+func _test_team_activation(sim: Node) -> void:
+	sim._active_teams = {0: {"dots": 5, "ids": [0, 1, 2, 3, 4]}}
+	sim._team_ids = {0: [0, 1, 2, 3, 4]}
+	_check("active team reports active", str(sim.is_team_active(0)), "true")
+	_check("inactive team reports inactive", str(sim.is_team_active(1)), "false")
+	sim._team_resources.clear()
+	for v in [100.0, 0.0, 0.0]:
+		sim._team_resources.append(v)
+	_check("resource readback", str(sim.get_team_resource(0)), "100.0")
+	_check("inactive pool reads 0", str(sim.get_team_resource(1)), "0.0")
+	_check("out-of-range pool reads 0", str(sim.get_team_resource(99)), "0.0")
+	# Deactivation clears the ledger and the pool.
+	sim.deactivate_team(0)
+	_check("deactivated team ledger cleared", str(sim._active_teams.has(0)), "false")
+	_check("deactivated team pool zeroed", str(sim._team_resources[0]), "0.0")
+	_check("deactivated id list cleared", str(sim._team_ids.has(0)), "false")
+	sim._active_teams = {}
+	sim._team_ids = {}
+
+
+## The initial BoidState buffer: size + all-dead (join-driven seeding).
 func _test_state_bytes(sim: Node) -> void:
 	sim.instance_count = 30
-	sim.num_teams = 3       # 2 player teams + the reserved NPC horde slot
-	sim._dots_per_team = 5  # army = 10
-	sim.hex_min_q = -10
-	sim.hex_min_r = 0
-	sim.hex_grid_width = 41
-	sim.hex_grid_depth = 21
-	sim.hex_width = 41
-	sim.hex_total_cells = 41 * 21
-
+	sim._dots_per_team = 5
 	var bytes: PackedByteArray = sim._build_state_bytes()
 	_check("buffer size = slots x 64", str(bytes.size()), str(30 * 64))
-
-	var bad_team := 0
-	var bad_health := 0
-	var bad_path := 0
-	var bad_state := 0
-	var outside_base := 0
-	for id in range(10):
-		var off := id * 64
-		var team := bytes.decode_u32(off + 44)
-		if team != id % 2:
-			bad_team += 1
-		if bytes.decode_u32(off + 48) != 1000:
-			bad_health += 1
-		if bytes.decode_u32(off + 36) != 0xFFFFFFFF:
-			bad_path += 1
-		if bytes.decode_u32(off + 32) != 0:
-			bad_state += 1
-		var px: float = bytes.decode_float(off)
-		var pz: float = bytes.decode_float(off + 8)
-		var hex: Vector2i = sim.world_to_hex(Vector2(px, pz))
-		var rect: Array = sim.team_bases[team]
-		var inside: bool = hex.x >= rect[0] and hex.x <= rect[2] \
-				and hex.y >= rect[1] and hex.y <= rect[3]
-		if not inside:
-			outside_base += 1
-	_check("army teams round-robin", str(bad_team), "0")
-	_check("army health 1000", str(bad_health), "0")
-	_check("army has no path", str(bad_path), "0")
-	_check("army state word clear", str(bad_state), "0")
-	_check("army stands in its base", str(outside_base), "0")
-	# Reserve slots (past the army) must stay dead: health 0 = never rendered.
-	_check("reserve slot health 0", str(bytes.decode_u32(20 * 64 + 48)), "0")
+	# Every slot must start DEAD (health 0): armies are seeded when phones
+	# join (activate_team), never at startup - a zeroed slot is never drawn.
+	var alive := 0
+	for id in range(30):
+		if bytes.decode_u32(id * 64 + 48) != 0:
+			alive += 1
+	_check("all slots start dead", str(alive), "0")
 
 ## Every uint field must be BIT-PACKED. Storing an int straight into the old
 ## float array wrote float 128.0 (bits 0x43000000) into the state word, which

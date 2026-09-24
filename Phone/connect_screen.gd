@@ -15,6 +15,7 @@ var _panel: Control
 var _status: Label
 var _input: LineEdit
 var _connect_btn: Button
+var _fullscreen_btn: Button
 var _spinner_time := 0.0
 var _visible_connected := false
 ## Non-empty = show this exact message instead of the animated
@@ -68,6 +69,20 @@ func _build_ui() -> void:
 	_connect_btn.pressed.connect(_try_connect)
 	box.add_child(_connect_btn)
 
+	# Web only: a canvas page can swallow keyboard input (the LineEdit above
+	# may never receive keystrokes depending on the browser's focus state),
+	# and mobile browsers have no hardware keyboard at all - so the primary
+	# way to enter an address on the web is the browser's own prompt dialog,
+	# which always works. The button doubles as the visible affordance for it.
+	if OS.has_feature("web"):
+		_connect_btn.text = "Enter address && connect"
+	
+	_fullscreen_btn = Button.new()
+	_fullscreen_btn.text = "Toggle fullscreen"
+	_fullscreen_btn.add_theme_font_size_override("font_size", 20)
+	_fullscreen_btn.pressed.connect(_toggle_fullscreen)
+	box.add_child(_fullscreen_btn)
+
 	_status = Label.new()
 	_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_status.add_theme_color_override("font_color", ACCENT)
@@ -75,6 +90,24 @@ func _build_ui() -> void:
 
 func _on_text_submitted(_t: String) -> void:
 	_try_connect()
+
+func _toggle_fullscreen() -> void:
+	# On web this maps to the browser's requestFullscreen; it must be
+	# called from a user gesture (a button press is one).
+	if DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_FULLSCREEN:
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+	else:
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
+
+## Browser prompt() - the reliable way to type text in a web export (the
+## engine's own LineEdit loses keyboard focus to the page in several
+## browsers, and touch devices have no keyboard to open for it).
+func _web_prompt_text() -> String:
+	if not OS.has_feature("web"):
+		return ""
+	var result = JavaScriptBridge.eval(
+			"window.prompt('Host address (IP:port or wss://...)','')", true)
+	return str(result) if result != null else ""
 
 func _process(delta: float) -> void:
 	if not visible:
@@ -108,6 +141,14 @@ func set_status(msg: String) -> void:
 
 func _try_connect() -> void:
 	var target := _input.text.strip_edges()
+	# Web: the LineEdit may never have received the keystrokes (browser
+	# canvas focus), so fall back to the browser's own prompt dialog.
+	if OS.has_feature("web"):
+		var typed = JavaScriptBridge.eval(
+				"window.prompt('Host address (IP:port or wss://...)','')", true)
+		if typed != null and not str(typed).is_empty():
+			target = str(typed).strip_edges()
+			_input.text = target
 	if target.is_empty():
 		set_status("type an address first")
 		return
