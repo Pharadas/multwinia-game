@@ -612,39 +612,40 @@ var _path_visual_timer := 0.0
 
 
 func _spawn_path_visual(points: Array, hex_id: int, team: int, slot: int, expiry: float) -> void:
-	var imm := ImmediateMesh.new()
-	imm.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
-	var width := 0.8
-	var height := 1.5
-	var prev := Vector3.INF
-	for p in points:
-		var cur := Vector3(float(p.x), height, float(p.y))
-		if prev != Vector3.INF:
-			var dir := cur - prev
-			dir.y = 0.0
-			if dir.length() > 0.01:
-				var n := Vector3(-dir.z, 0.0, dir.x).normalized() * (width * 0.5)
-				imm.surface_add_vertex(prev - n)
-				imm.surface_add_vertex(prev + n)
-				imm.surface_add_vertex(cur + n)
-				imm.surface_add_vertex(prev - n)
-				imm.surface_add_vertex(cur + n)
-				imm.surface_add_vertex(cur - n)
-		prev = cur
-	imm.surface_end()
-	var mat := StandardMaterial3D.new()
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	match team % 4:
-		0: mat.albedo_color = Color(1.0, 0.25, 0.25, 0.65)
-		1: mat.albedo_color = Color(0.25, 1.0, 0.25, 0.65)
-		2: mat.albedo_color = Color(0.3, 0.5, 1.0, 0.65)
-		_: mat.albedo_color = Color(1.0, 0.9, 0.25, 0.65)
-	var mi := MeshInstance3D.new()
-	mi.mesh = imm
-	mi.material_override = mat
-	add_child(mi)
-	_path_visuals.append({"mesh": mi, "hex_id": hex_id, "team": team, "slot": slot, "expiry": expiry})
+	pass
+	#var imm := ImmediateMesh.new()
+	#imm.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	#var width := 0.8
+	#var height := 1.5
+	#var prev := Vector3.INF
+	#for p in points:
+		#var cur := Vector3(float(p.x), height, float(p.y))
+		#if prev != Vector3.INF:
+			#var dir := cur - prev
+			#dir.y = 0.0
+			#if dir.length() > 0.01:
+				#var n := Vector3(-dir.z, 0.0, dir.x).normalized() * (width * 0.5)
+				#imm.surface_add_vertex(prev - n)
+				#imm.surface_add_vertex(prev + n)
+				#imm.surface_add_vertex(cur + n)
+				#imm.surface_add_vertex(prev - n)
+				#imm.surface_add_vertex(cur + n)
+				#imm.surface_add_vertex(cur - n)
+		#prev = cur
+	#imm.surface_end()
+	#var mat := StandardMaterial3D.new()
+	#mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	#mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	#match team % 4:
+		#0: mat.albedo_color = Color(1.0, 0.25, 0.25, 0.65)
+		#1: mat.albedo_color = Color(0.25, 1.0, 0.25, 0.65)
+		#2: mat.albedo_color = Color(0.3, 0.5, 1.0, 0.65)
+		#_: mat.albedo_color = Color(1.0, 0.9, 0.25, 0.65)
+	#var mi := MeshInstance3D.new()
+	#mi.mesh = imm
+	#mi.material_override = mat
+	#add_child(mi)
+	#_path_visuals.append({"mesh": mi, "hex_id": hex_id, "team": team, "slot": slot, "expiry": expiry})
 
 
 ## Every 0.5 s: free a path ribbon once its expiry has passed AND the GPU
@@ -652,35 +653,36 @@ func _spawn_path_visual(points: Array, hex_id: int, team: int, slot: int, expiry
 ## that claimed it has arrived. While stragglers remain, an expired path
 ## fades to 25% so it's clear no NEW boids can claim it.
 func _update_path_visuals(delta: float) -> void:
-	if _path_visuals.is_empty():
-		return
-	_path_visual_timer += delta
-	if _path_visual_timer < 0.5:
-		return
-	_path_visual_timer = 0.0
-	var ss_node := get_node_or_null("StupidSimple")
-	var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
-	if ss == null or not ss.has_method("get_path_followers"):
-		return
-	var now: float = ss._elapsed_seconds
-	var i := _path_visuals.size() - 1
-	while i >= 0:
-		var v: Dictionary = _path_visuals[i]
-		var mi: MeshInstance3D = v.mesh
-		if not is_instance_valid(mi):
-			_path_visuals.remove_at(i)
-		else:
-			var expired: bool = float(v.expiry) > 0.0 and now > float(v.expiry)
-			if expired:
-				var followers: int = ss.get_path_followers(int(v.hex_id), int(v.team), int(v.slot))
-				if followers <= 0:
-					mi.queue_free()
-					_path_visuals.remove_at(i)
-				else:
-					var m := mi.material_override as StandardMaterial3D
-					if m and m.albedo_color.a > 0.3:
-						m.albedo_color.a = 0.25
-		i -= 1
+	pass
+	#if _path_visuals.is_empty():
+		#return
+	#_path_visual_timer += delta
+	#if _path_visual_timer < 0.5:
+		#return
+	#_path_visual_timer = 0.0
+	#var ss_node := get_node_or_null("StupidSimple")
+	#var ss = ss_node.get_child(0) if ss_node and ss_node.get_child_count() > 0 else null
+	#if ss == null or not ss.has_method("get_path_followers"):
+		#return
+	#var now: float = ss._elapsed_seconds
+	#var i := _path_visuals.size() - 1
+	#while i >= 0:
+		#var v: Dictionary = _path_visuals[i]
+		#var mi: MeshInstance3D = v.mesh
+		#if not is_instance_valid(mi):
+			#_path_visuals.remove_at(i)
+		#else:
+			#var expired: bool = float(v.expiry) > 0.0 and now > float(v.expiry)
+			#if expired:
+				#var followers: int = ss.get_path_followers(int(v.hex_id), int(v.team), int(v.slot))
+				#if followers <= 0:
+					#mi.queue_free()
+					#_path_visuals.remove_at(i)
+				#else:
+					#var m := mi.material_override as StandardMaterial3D
+					#if m and m.albedo_color.a > 0.3:
+						#m.albedo_color.a = 0.25
+		#i -= 1
 
 
 ## A phone dropped a building on hex (col, row) as a WHOLE. It starts as a

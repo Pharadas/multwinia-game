@@ -59,7 +59,16 @@ func _build_ui() -> void:
 
 	var hint := Label.new()
 	if OS.has_feature("web"):
-		hint.text = "No game found yet.\nClick the button and type the host's address\nin the browser's own prompt box - IP:port, or a\nwss:// address for a page hosted on itch.io."
+		# A secure page (itch.io, GitHub Pages) can only open wss:// - the
+		# browser blocks ws:// as mixed content - so a game on the LAN is
+		# UNREACHABLE from here, and saying "type an address" just leads to
+		# doomed attempts. Point those players at the page the game itself
+		# serves: it is plain HTTP, auto-connects, and needs no typing.
+		var proto := str(JavaScriptBridge.eval("window.location.protocol", true))
+		if proto.begins_with("https"):
+			hint.text = "This page is HTTPS, so the browser only allows\nwss:// connections - a game on your WiFi cannot be\ndialed from here.\n\nOn the game PC's WiFi, open http://<game-ip>:9095 -\nthe page the game serves - it connects automatically.\n\nOr type a wss:// tunnel address below."
+		else:
+			hint.text = "No game found yet.\nClick the button and type the host's address\nin the browser's own prompt box - IP:port, or a\nwss:// address for a page hosted on itch.io."
 	else:
 		hint.text = "Enter the host's IP (e.g. 203.0.113.7), IP:port,\nor a full ws:// or wss:// address."
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER

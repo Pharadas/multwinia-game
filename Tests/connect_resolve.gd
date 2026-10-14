@@ -168,6 +168,19 @@ func _test_resolution(phone: HexGrid2DSocket) -> void:
 		# Query host on an https page: scheme follows the page (wss).
 		["?host= on https page", "https://pharadas.itch.io/multiwinian?host=203.0.113.7&port=9080",
 			"pharadas.itch.io", "https:", "", "wss://203.0.113.7:9080"],
+		# An http(s):// URL names the game's PAGE, never its WebSocket: the
+		# typed port is a page port (9095/443) and must be dropped in favour
+		# of the standard ports. Regression: "http://ip:9095" used to parse
+		# into the garbage host "http:" and retry wss://http: forever.
+		["typed http:// page URL on http page",
+			"http://192.168.1.82:8000/index.html", "192.168.1.82", "http:",
+			"http://203.0.113.7:9095", "ws://203.0.113.7:9080"],
+		["typed http:// page URL on https page", "https://pharadas.itch.io/multiwinian",
+			"pharadas.itch.io", "https:", "http://192.168.1.82:9095",
+			"ws://192.168.1.82:9080"],
+		["typed https:// page URL", "https://pharadas.itch.io/multiwinian",
+			"pharadas.itch.io", "https:", "https://tunnel.example.com/phone",
+			"wss://tunnel.example.com"],
 	]
 
 	for case in cases:

@@ -688,6 +688,13 @@ func parse_remote_target(target: String, new_port: int = 0) -> void:
 	remote_use_tls = false
 	remote_scheme_explicit = false
 	remote_explicit_port = new_port if new_port > 0 else 0
+	# http(s):// URLs name the game's PAGE, not its WebSocket endpoint: their
+	# port is a page port (9095, 443) and must never become the dial port -
+	# the game answers on websocket_port (or 443 for TLS, implicitly). Without
+	# this branch, typing "http://ip:9095" fell through to the first-slash
+	# cut INSIDE the scheme, yielding the garbage host "http:" and an endless
+	# retry of the invalid URL "wss://http:".
+	var page_style := false
 	if t.begins_with("wss://"):
 		remote_use_tls = true
 		remote_scheme_explicit = true
@@ -695,6 +702,15 @@ func parse_remote_target(target: String, new_port: int = 0) -> void:
 	elif t.begins_with("ws://"):
 		remote_scheme_explicit = true
 		t = t.trim_prefix("ws://")
+	elif t.begins_with("https://"):
+		remote_use_tls = true
+		remote_scheme_explicit = true
+		page_style = true
+		t = t.trim_prefix("https://")
+	elif t.begins_with("http://"):
+		remote_scheme_explicit = true
+		page_style = true
+		t = t.trim_prefix("http://")
 	# Strip any path ("wss://host/whatever" -> "host"); we dial the root.
 	var slash := t.find("/")
 	if slash >= 0:
@@ -704,7 +720,10 @@ func parse_remote_target(target: String, new_port: int = 0) -> void:
 	if colon > 0:
 		var p := t.substr(colon + 1).to_int()
 		if p > 0:
-			remote_explicit_port = p
+			if not page_style:
+				remote_explicit_port = p
+			# page_style: the port names the PAGE (9095/443) - drop it and
+			# let the standard ports apply instead.
 			t = t.substr(0, colon)
 	remote_host_override = t
 
