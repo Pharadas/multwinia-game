@@ -184,6 +184,8 @@ func _connect_socket() -> void:
 				socket.is_web_connected() if socket.has_method("is_web_connected") else false)
 	if socket and socket.has_signal("lan_sweep_state_changed"):
 		socket.lan_sweep_state_changed.connect(_on_lan_sweep_state_changed)
+	if socket and socket.has_signal("connection_attempt_failed"):
+		socket.connection_attempt_failed.connect(_on_connection_attempt_failed)
 	if socket and connect_screen and not connect_screen.connect_requested.is_connected(_on_connect_requested):
 		connect_screen.connect_requested.connect(_on_connect_requested)
 
@@ -224,6 +226,18 @@ func _on_connection_state_changed(connected: bool) -> void:
 		connect_screen.set_status("Enter the game host's address to connect.")
 	else:
 		connect_screen.set_status("trying %s ..." % url)
+
+## A dial was refused, reset or never completed (web only). Replace the
+## animated "connecting..." spinner with the honest version - without this
+## a failing connection looks identical to a slow one, and the retries
+## (every second, in the socket) are invisible.
+func _on_connection_attempt_failed(url: String, _code: int) -> void:
+	if connect_screen == null or not OS.has_feature("web"):
+		return
+	var socket := _get_socket_node()
+	if socket and socket.has_method("is_sweeping") and socket.is_sweeping():
+		return # "searching your WiFi..." is the more useful message right now
+	connect_screen.set_status("couldn't reach %s - retrying..." % url)
 
 
 # --- terrain / network data ---------------------------------------------------

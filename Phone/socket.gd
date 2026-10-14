@@ -98,6 +98,13 @@ signal team_resources_received(team: int, amount: float)
 ## it to show/hide the manual-connect screen.
 signal connection_state_changed(connected: bool)
 
+## Emitted when a connection ATTEMPT ends without the socket ever opening
+## (refused, reset, or a handshake that never completed). Without it the UI
+## can only spin "connecting..." forever: connection_state_changed only
+## fires after a previously-open connection DROPPED, so a dial that never
+## succeeded is completely silent.
+signal connection_attempt_failed(url: String, code: int)
+
 ## Emitted when the browser starts / stops scanning the local network for a
 ## game (see the sweep below). The UI shows "searching..." while it runs so
 ## a player knows the phone is still trying on its own.
@@ -130,6 +137,13 @@ var _is_web: bool = OS.has_feature("web")
 var _ws := WebSocketPeer.new()
 var _ws_url := ""
 var _ws_retry_elapsed := 0.0
+## How long an attempt may sit in CONNECTING before it is aborted and
+## retried. Browsers do time out their own WebSockets eventually, but not
+## reliably - a server that accepts the TCP connection and then never
+## answers the upgrade can leave the attempt pending for minutes, and
+## nothing else in this loop would ever close the peer.
+const WS_HANDSHAKE_TIMEOUT := 10.0
+var _ws_connecting_elapsed := 0.0
 ## Manual UI override for the WS host - non-empty wins over all URL resolution.
 var remote_host_override := ""
 ## TLS flag for the override: true when the typed address was wss:// (needed
@@ -397,6 +411,7 @@ func _connect_websocket() -> void:
 	# silently breaks above it) - match the 4 MB the TCP path uses.
 	_ws.inbound_buffer_size = 4 * 1024 * 1024
 	_ws.outbound_buffer_size = 4 * 1024 * 1024
+	_ws_connecting_elapsed = 0.0
 	if _ws_url.is_empty():
 		# Nothing usable to dial yet - e.g. the page is hosted on an HTTPS
 		# CDN and no game address has been supplied. Retrying a guaranteed
@@ -423,14 +438,30 @@ func _process_websocket(delta: float) -> void:
 			print("HexGrid2DSocket: WebSocket connected to %s." % _ws_url)
 			emit_signal("connection_state_changed", true)
 			_ws.send_text(JSON.stringify({"type": "request_terrain"}))
+		_ws_connecting_elapsed = 0.0
 		while _ws.get_available_packet_count() > 0:
 			var parsed: Variant = JSON.parse_string(_ws.get_packet().get_string_from_utf8())
 			if parsed is Dictionary:
 				_handle_message(_deref_json(parsed))
+	elif state == WebSocketPeer.STATE_CONNECTING:
+		_ws_connecting_elapsed += delta
+		if _ws_connecting_elapsed >= WS_HANDSHAKE_TIMEOUT:
+			print("HexGrid2DSocket: WebSocket handshake to %s timed out after %.0fs - retrying." % [_ws_url, WS_HANDSHAKE_TIMEOUT])
+			# Closing moves the peer to STATE_CLOSED, where the normal retry
+			# path (and the failure signal below) picks it up next poll.
+			_ws.close()
 	elif state == WebSocketPeer.STATE_CLOSED:
+		_ws_connecting_elapsed = 0.0
 		if _was_connected:
 			print("HexGrid2DSocket: WebSocket closed - retrying every %.1fs." % retry_interval)
 			emit_signal("connection_state_changed", false)
+		elif not _ws_url.is_empty():
+			# An attempt that never opened: refused, reset or rejected.
+			# Say so out loud - otherwise the UI spins "connecting..."
+			# forever while every retry fails silently.
+			var code := _ws.get_close_code()
+			print("HexGrid2DSocket: WebSocket to %s failed (close code %d) - retrying every %.1fs." % [_ws_url, code, retry_interval])
+			emit_signal("connection_attempt_failed", _ws_url, code)
 		_was_connected = false
 		# No game at the automatic target: start (or resume) scanning the
 		# local network. A no-op while a scan is running or cooling down.
